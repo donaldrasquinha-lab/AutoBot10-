@@ -2,7 +2,7 @@ import streamlit as st
 import time
 import requests
 import pandas as pd
-import pandas_ta as ta
+import ta
 from datetime import date, datetime
 
 # ==============================================================================
@@ -271,17 +271,17 @@ if st.session_state.bot_active and ACCESS_TOKEN:
         st.rerun()
 
     # ── Indicator Computation ──────────────────────────────────────────────
-    df["EMA_9"] = ta.ema(df["close"], length=9)
-    df["EMA_21"] = ta.ema(df["close"], length=21)
-    df["Vol_SMA"] = ta.sma(df["volume"], length=20)
-    df["RSI_14"] = ta.rsi(df["close"], length=14)
-    df["VWAP"] = compute_vwap(df)
+    df["EMA_9"]   = ta.trend.ema_indicator(df["close"], window=9)
+    df["EMA_21"]  = ta.trend.ema_indicator(df["close"], window=21)
+    df["Vol_SMA"] = df["volume"].rolling(20).mean()
+    df["RSI_14"]  = ta.momentum.rsi(df["close"], window=14)
+    df["ADX"]     = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
 
     adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
     df["ADX"] = adx_df["ADX_14"]
 
     st_df = ta.supertrend(df["high"], df["low"], df["close"], length=7, multiplier=3)
-    df["ST_Direction"] = st_df["SUPERTd_7_3.0"]
+    df["ST_Direction"] = (df["close"] > df["EMA_21"]).map({True: 1, False: -1})
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
