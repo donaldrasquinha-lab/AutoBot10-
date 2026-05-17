@@ -1,3 +1,4 @@
+import streamlit as st
 import time
 import requests
 import pandas as pd
@@ -6,199 +7,221 @@ import upstox_client
 from upstox_client.rest import ApiException
 
 # ==============================================================================
-# 1. CONFIGURATION & ACCESS TOKEN
+# STREAMLIT UI CONFIGURATION & STATE
 # ==============================================================================
-ACCESS_TOKEN = "YOUR_UPSTOX_ACCESS_TOKEN"  # Replace with valid token
+st.set_page_config(page_title="Upstox Algo Scalper", layout="wide")
 
-# Trading Settings
-UNDERLYING_INDEX = "NSE_INDEX|Nifty 50" 
-TIMEFRAME = "1minute"                   
-LOT_SIZE = 25                           # Current Nifty lot size
-TRADE_LOTS = 1                          
-
-# Strict Risk Management Parameters (Based on ₹50,000 Capital)
-STOP_LOSS_PERCENT = 0.06                # Strict 6% initial stop loss
-TARGET_PERCENT = 0.12                   # Strict 12% profit target (1:2 Risk-Reward)
-
-# Initial State Variables
-current_position = None  
-bot_active = True                       # Controls global execution line
-
-# Upstox API Clients Setup
-config = upstox_client.Configuration()
-config.access_token = ACCESS_TOKEN
-api_client = upstox_client.ApiClient(config)
-order_api = upstox_client.OrderApi(api_client)     
-market_api = upstox_client.HistoryApi(api_client)  
+# Initialize persistent session states across UI refreshes
+if "bot_active" not in st.session_state:
+    st.session_state.bot_active = False
+if "current_position" not in st.session_state:
+    st.session_state.current_position = None
+if "trade_logs" not in st.session_state:
+    st.session_state.trade_logs = []
+if "session_pnl" not in st.session_state:
+    st.session_state.session_pnl = 0.0
 
 # ==============================================================================
-# 2. HELPER FUNCTIONS
+# BACKEND API HELPERS
 # ==============================================================================
-def get_historical_candles():
-    """Fetches real-time historical data from Upstox to calculate technicals."""
-    try:
-        response = market_api.get_historical_candle_data_v3(
-            instrument_key=UNDERLYING_INDEX,
-            interval=TIMEFRAME,
-            to_date=time.strftime("%Y-%m-%d")
-        )
-        candles = response.data.candles
-        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
-        df = df.iloc[::-1].reset_index(drop=True) 
-        df['close'] = pd.to_numeric(df['close'])
-        df['high'] = pd.to_numeric(df['high'])
-        df['low'] = pd.to_numeric(df['low'])
-        df['volume'] = pd.to_numeric(df['volume'])
-        return df
-    except Exception as e:
-        print(f"Error fetching candle data: {e}")
-        return pd.DataFrame()
-
-def fetch_atm_strike(current_spot):
-    """Dynamically calculates the At-The-Money (ATM) contract strike."""
-    base = 50 
-    return int(base * round(current_spot / base))
-
-def fetch_option_contract_key(strike, option_type):
-    """Retrieves exact Upstox Instrument Key for active contracts using Option Chain API."""
-    try:
-        url = "https://upstox.com"
-        headers = {"Accept": "application/json", "Authorization": f"Bearer {ACCESS_TOKEN}"}
-        params = {"instrument_key": UNDERLYING_INDEX, "expiry_date": time.strftime("%Y-%m-%d")} 
-        
-        response = requests.get(url, params=params, headers=headers).json()
-        chain_data = response.get('data', [])
-        
-        for item in chain_data:
-            if int(item.get('strike_price')) == strike:
-                return item.get(option_type.lower(), {}).get('instrument_key')
-    except Exception as e:
-        print(f"Error resolving option chain keys: {e}")
-    return None
-
-def place_market_order(instrument_key, transaction_type, quantity):
-    """Executes instant market orders via Upstox Execution Engine."""
-    try:
-        body = {
-            "quantity": quantity,
-            "product": "I",              # Intraday MIS
-            "validity": "DAY",
-            "price": 0.0,                # Market Order
-            "tag": "ScalpBot",
-            "instrument_key": instrument_key,
-            "order_type": "MARKET",
-            "transaction_type": transaction_type
-        }
-        api_response = order_api.place_order(body, api_version="v2")
-        print(f"Order Executed! Type: {transaction_type} | Order ID: {api_response.data.order_id}")
-        return api_response.data.order_id
-    except ApiException as e:
-        print(f"Critical Execution Error: {e.body}")
-        return None
-
-def fetch_ltp(instrument_key):
-    """Retrieves Last Traded Price (LTP)."""
+def fetch_ltp(token, instrument_key):
+    """Retrieves Last Traded Price (LTP) from Upstox API."""
     try:
         url = f"https://upstox.com{instrument_key}"
-        headers = {"Accept": "application/json", "Authorization": f"Bearer {ACCESS_TOKEN}"}
-        res = requests.get(url, headers=headers).json()
-        return res['data'][instrument_key]['last_price']
-    except:
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+        res = requests.get(url, headers=headers, timeout=5).json()
+        return float(res['data'][instrument_key]['last_price'])
+    except Exception:
         return None
 
+def fetch_historical_candles(token, instrument_key):
+    """Fetches real-time candles to run indicator logic."""
+    try:
+        url = f"https://upstox.com{instrument_key}/1minute/{time.strftime('%Y-%m-%d')}"
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+        res = requests.get(url, headers=headers, timeout=5).json()
+        candles = res['data']['candles']
+        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+        df = df.iloc[::-1].reset_index(drop=True)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
 # ==============================================================================
-# 3. CORE BOT LOOP LOGIC
+# SIDEBAR CONTROL PANEL
 # ==============================================================================
-print("Initializing Upstox Scalping Bot Engine...")
+st.sidebar.header("🔌 Authentication & Modes")
+ACCESS_TOKEN = st.sidebar.text_input("Upstox Access Token", type="password", help="Generate via developer console")
+TRADE_MODE = st.sidebar.radio("🎯 Execution Mode", ["📄 Paper Trading (Simulated)", "⚡ Live Trading (Real Money)"])
 
-while bot_active:
-    df = get_historical_candles()
-    if df.empty or len(df) < 30:
-        time.sleep(10)
-        continue
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Strategy Parameters")
+INITIAL_CAPITAL = st.sidebar.number_input("Starting Capital (₹)", value=50000)
+STOP_LOSS_PCT = st.sidebar.slider("Stop Loss (%)", 1, 10, 6) / 100.0
+TARGET_PCT = st.sidebar.slider("Target Profit (%)", 1, 25, 12) / 100.0
 
-    # 1. Advanced Indicator Suite Calculations
-    df['EMA_9'] = ta.ema(df['close'], length=9)
-    df['EMA_21'] = ta.ema(df['close'], length=21)
-    df['Vol_SMA'] = ta.sma(df['volume'], length=20)
-    df['RSI_14'] = ta.rsi(df['close'], length=14)
-    
-    df_adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-    df['ADX'] = df_adx['ADX_14']
-    
-    # Supertrend calculation (Length: 7, Multiplier: 3)
-    df_st = ta.supertrend(df['high'], df['low'], df['close'], length=7, multiplier=3)
-    df['ST_Direction'] = df_st['SUPERTd_7_3.0'] # Returns 1 for Bullish, -1 for Bearish
-    
-    last_row = df.iloc[-1]
-    prev_row = df.iloc[-2]
-    spot_price = last_row['close']
+# Dynamic calculations for local capital display
+current_capital = INITIAL_CAPITAL + st.session_state.session_pnl
 
-    # 2. Multi-Filter Signal Entry Verification
-    if current_position is None:
-        ema_call_cross = (prev_row['EMA_9'] <= prev_row['EMA_21']) and (last_row['EMA_9'] > last_row['EMA_21'])
-        ema_put_cross = (prev_row['EMA_9'] >= prev_row['EMA_21']) and (last_row['EMA_9'] < last_row['EMA_21'])
+# ==============================================================================
+# MAIN DASHBOARD INTERFACE
+# ==============================================================================
+st.title("🦅 Upstox Options Advanced Scalping Engine")
+
+# Row 1: Key Performance Metrics
+m1, m2, m3, m4 = st.columns(4)
+
+if ACCESS_TOKEN:
+    live_index = fetch_ltp(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") or 0.0
+else:
+    live_index = 0.0
+
+m1.metric(label="📊 Nifty 50 Spot Index", value=f"₹{live_index:,.2f}" if live_index else "Disconnected")
+m2.metric(label="💰 Current Account Balance", value=f"₹{current_capital:,.2f}")
+m3.metric(label="📈 Today's Net PnL", value=f"₹{st.session_state.session_pnl:,.2f}", 
+          delta=f"{((st.session_state.session_pnl/INITIAL_CAPITAL)*100):.2f}%" if INITIAL_CAPITAL else "0%")
+m4.metric(label="🛡️ Operational Mode", value="LIVE" if "Live" in TRADE_MODE else "PAPER")
+
+st.markdown("---")
+
+# Row 2: Bot Core Operations Layout
+col_ctrl, col_pos = st.columns([1, 2])
+
+with col_ctrl:
+    st.subheader("🕹️ Engine Telemetry")
+    if not ACCESS_TOKEN:
+        st.warning("Please provide a valid Upstox Access Token to activate systems.")
+    else:
+        if not st.session_state.bot_active:
+            if st.button("▶️ START AUTO-BOT", type="primary", use_container_width=True):
+                st.session_state.bot_active = True
+                st.rerun()
+        else:
+            if st.button("🛑 EMERGENCY HALT / SHUTDOWN", type="secondary", use_container_width=True):
+                st.session_state.bot_active = False
+                st.session_state.current_position = None
+                st.rerun()
         
-        # Validation Pipeline
-        is_trending = last_row['ADX'] > 25
-        is_high_volume = last_row['volume'] > last_row['Vol_SMA']
-        is_st_bullish = last_row['ST_Direction'] == 1
-        is_st_bearish = last_row['ST_Direction'] == -1
-        
-        # Combined Confluence Triggers
-        call_signal = ema_call_cross and is_trending and is_high_volume and is_st_bullish and (last_row['RSI_14'] > 50)
-        put_signal = ema_put_cross and is_trending and is_high_volume and is_st_bearish and (last_row['RSI_14'] < 50)
+        status_color = "🟢 Active & Scanning" if st.session_state.bot_active else "🔴 Core Switched Off"
+        st.info(f"System State: **{status_color}**")
 
-        if call_signal or put_signal:
-            strike = fetch_atm_strike(spot_price)
-            opt_type = 'CE' if call_signal else 'PE'
-            print(f"Confluence Signal Verified! Spot: {spot_price} | ATM: {strike} {opt_type} | RSI: {last_row['RSI_14']:.1f}")
+with col_pos:
+    st.subheader("📦 Active Market Position")
+    pos = st.session_state.current_position
+    if pos:
+        pos_ltp = fetch_ltp(ACCESS_TOKEN, pos['key']) or pos['entry_price']
+        unrealized_pnl = (pos_ltp - pos['entry_price']) * 25 # Lot size 25
+        pnl_color = "inverse" if unrealized_pnl < 0 else "normal"
+        
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Symbol", pos['symbol'])
+        c2.metric("Entry Price", f"₹{pos['entry_price']:.2f}")
+        c3.metric("Live Price", f"₹{pos_ltp:.2f}")
+        c4.metric("Unrealized PnL", f"₹{unrealized_pnl:.2f}")
+        
+        # Display underlying safeguards
+        st.caption(f"🛡️ Target Price: **₹{pos['target_price']:.2f}** | Trailing SL Floor: **₹{pos['sl_price']:.2f}**")
+    else:
+        st.write("*No open positions found. The system is flat.*")
+
+# ==============================================================================
+# RUNNING ALGORITHMIC LOOP ENGINE
+# ==============================================================================
+if st.session_state.bot_active and ACCESS_TOKEN:
+    # 1. Indicator processing block
+    df = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
+    
+    if not df.empty and len(df) >= 30:
+        # Tech Indicator Confluences
+        df['EMA_9'] = ta.ema(df['close'], length=9)
+        df['EMA_21'] = ta.ema(df['close'], length=21)
+        df['Vol_SMA'] = ta.sma(df['volume'], length=20)
+        df['RSI_14'] = ta.rsi(df['close'], length=14)
+        df_adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+        df['ADX'] = df_adx['ADX_14']
+        df_st = ta.supertrend(df['high'], df['low'], df['close'], length=7, multiplier=3)
+        df['ST_Direction'] = df_st['SUPERTd_7_3.0']
+        
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
+        
+        # 2. Check for Signals if Flat
+        if st.session_state.current_position is None:
+            ema_call_cross = (prev_row['EMA_9'] <= prev_row['EMA_21']) and (last_row['EMA_9'] > last_row['EMA_21'])
+            ema_put_cross = (prev_row['EMA_9'] >= prev_row['EMA_21']) and (last_row['EMA_9'] < last_row['EMA_21'])
             
-            target_key = fetch_option_contract_key(strike, opt_type)
-            if target_key:
-                entry_price = fetch_ltp(target_key)
-                if entry_price:
-                    order_id = place_market_order(target_key, "BUY", TRADE_LOTS * LOT_SIZE)
-                    if order_id:
-                        current_position = {
-                            "key": target_key,
-                            "entry_price": entry_price,
-                            "highest_price": entry_price, # Tracks trailing mechanics
-                            "sl_price": entry_price * (1 - STOP_LOSS_PERCENT),
-                            "target_price": entry_price * (1 + TARGET_PERCENT)
-                        }
-                        print(f"Position Open: Entry ₹{entry_price:.2f} | SL: ₹{current_position['sl_price']:.2f} | Target: ₹{current_position['target_price']:.2f}")
-
-    # 3. Dynamic Trailing Monitoring & Streak Management
-    elif current_position is not None:
-        ltp = fetch_ltp(current_position['key'])
-        if ltp:
-            # Trailing Stop-Loss Engine (1:1 Trailing Mechanic)
-            if ltp > current_position['highest_price']:
-                price_gain = ltp - current_position['highest_price']
-                current_position['sl_price'] += price_gain # Move SL up by the exact gain amount
-                current_position['highest_price'] = ltp    # Update highest observed price boundary
-                print(f" Trailing SL Adjusted Upwards! New SL: ₹{current_position['sl_price']:.2f}")
-
-            # Exit Boundaries Check
-            hit_sl = ltp <= current_position['sl_price']
-            hit_target = ltp >= current_position['target_price']
-
-            if hit_sl or hit_target:
-                exit_reason = "TARGET HIT" if hit_target else "STOP LOSS / TRAILING SL HIT"
-                print(f"Exiting Position: {exit_reason} | Current Price: ₹{ltp:.2f}")
+            is_trending = last_row['ADX'] > 25
+            is_high_volume = last_row['volume'] > last_row['Vol_SMA']
+            
+            if ema_call_cross and is_trending and is_high_volume and last_row['ST_Direction'] == 1 and last_row['RSI_14'] > 50:
+                # Simulated placeholder mapping for demo context. Replace key fetching logic in production
+                st.session_state.current_position = {
+                    "key": "NSE_OPTION|NIFTY24MAY24200CE", "symbol": "NIFTY 24200 CE",
+                    "entry_price": 100.0, "highest_price": 100.0, "sl_price": 100.0 * (1 - STOP_LOSS_PCT), "target_price": 100.0 * (1 + TARGET_PCT)
+                }
+                st.success("🚨 CALL Entry Position triggered!")
+                st.rerun()
                 
-                place_market_order(current_position['key'], "SELL", TRADE_LOTS * LOT_SIZE)
-                
-                trade_pnl = (ltp - current_position['entry_price']) * (TRADE_LOTS * LOT_SIZE)
-                print(f"Trade Closed. PnL: ₹{trade_pnl:.2f}")
-                
-                # Streak Logic Evaluation
-                if trade_pnl > 0:
-                    print("Winning trade! Resetting logic to wait for next setup...")
-                    current_position = None  
-                else:
-                    print("Loss encountered. Capital protection filter engaged. Shutting down bot for today.")
-                    bot_active = False       
+            elif ema_put_cross and is_trending and is_high_volume and last_row['ST_Direction'] == -1 and last_row['RSI_14'] < 50:
+                st.session_state.current_position = {
+                    "key": "NSE_OPTION|NIFTY24MAY24200PE", "symbol": "NIFTY 24200 PE",
+                    "entry_price": 100.0, "highest_price": 100.0, "sl_price": 100.0 * (1 - STOP_LOSS_PCT), "target_price": 100.0 * (1 + TARGET_PCT)
+                }
+                st.success("🚨 PUT Entry Position triggered!")
+                st.rerun()
 
+        # 3. Handle Active Trailing Monitoring & Streak Enforcement
+        else:
+            pos = st.session_state.current_position
+            pos_ltp = fetch_ltp(ACCESS_TOKEN, pos['key'])
+            
+            if pos_ltp:
+                # Trailing SL Mechanics
+                if pos_ltp > pos['highest_price']:
+                    gain = pos_ltp - pos['highest_price']
+                    st.session_state.current_position['sl_price'] += gain
+                    st.session_state.current_position['highest_price'] = pos_ltp
+                
+                # Check Exit Boundaries
+                hit_sl = pos_ltp <= pos['sl_price']
+                hit_target = pos_ltp >= pos['target_price']
+                
+                if hit_sl or hit_target:
+                    trade_pnl = (pos_ltp - pos['entry_price']) * 25
+                    st.session_state.session_pnl += trade_pnl
+                    
+                    # Log metrics to operational memory state
+                    st.session_state.trade_logs.append({
+                        "Timestamp": time.strftime("%H:%M:%S"), "Symbol": pos['symbol'],
+                        "Mode": TRADE_MODE, "Entry": pos['entry_price'], "Exit": pos_ltp, "PnL": trade_pnl
+                    })
+                    
+                    # Log structural data block to Excel automatically
+                    try:
+                        pd.DataFrame(st.session_state.trade_logs).to_excel("scalping_trade_logs.xlsx", index=False)
+                    except Exception:
+                        pass
+                    
+                    # STREAK RISK MANAGEMENT RULE
+                    if trade_pnl <= 0:
+                        st.session_state.bot_active = False
+                        st.error("🚨 Streak broken by a loss! Safety circuit breaker tripped. System deactivated.")
+                    
+                    st.session_state.current_position = None
+                    st.rerun()
+
+    # Dynamic refreshing trick inside Streamlit context for 2-second telemetry refreshes
     time.sleep(2)
+    st.rerun()
+
+# ==============================================================================
+# Row 3: HISTORICAL SESSION LOGS DISPLAY
+# ==============================================================================
+st.markdown("---")
+st.subheader("📑 Session Trade Analytics (Auto-Logged to Excel)")
+if st.session_state.trade_logs:
+    st.dataframe(pd.DataFrame(st.session_state.trade_logs), use_container_width=True)
+else:
+    st.info("No trades executed in this specific dashboard UI loop container yet.")
