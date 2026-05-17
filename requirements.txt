@@ -1,4 +1,4 @@
-upstox-python-sdk==2.0.1
+upstox-python-sdk==2.5.0
 pandas-ta==0.3.14b0
 pandas==2.2.2
 openpyxl==3.1.5
