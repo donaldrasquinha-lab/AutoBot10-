@@ -625,12 +625,12 @@ if st.session_state.bot_active and ACCESS_TOKEN:
     df["ADX"]          = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
     
     def compute_supertrend(df: pd.DataFrame, length: int = 7, multiplier: float = 3.0) -> pd.Series:
-    hl_avg = (df["high"] + df["low"]) / 2
-    atr    = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=length)
-    upper  = hl_avg + multiplier * atr
-    lower  = hl_avg - multiplier * atr
+     hl_avg = (df["high"] + df["low"]) / 2
+     atr    = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=length)
+     upper  = hl_avg + multiplier * atr
+     lower  = hl_avg - multiplier * atr
     
-    direction = pd.Series(1, index=df.index)
+     direction = pd.Series(1, index=df.index)
     for i in range(1, len(df)):
         if df["close"].iloc[i] > upper.iloc[i - 1]:
             direction.iloc[i] = 1
@@ -638,7 +638,7 @@ if st.session_state.bot_active and ACCESS_TOKEN:
             direction.iloc[i] = -1
         else:
             direction.iloc[i] = direction.iloc[i - 1]
-    return direction
+     return direction
 
     df["ST_Direction"] = compute_supertrend(df)
     
