@@ -638,7 +638,7 @@ if st.session_state.bot_active and ACCESS_TOKEN:
             direction.iloc[i] = -1
         else:
             direction.iloc[i] = direction.iloc[i - 1]
-     return direction
+    return direction
 
     df["ST_Direction"] = compute_supertrend(df)
     
