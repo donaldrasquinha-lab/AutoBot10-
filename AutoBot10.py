@@ -2,7 +2,7 @@ import streamlit as st
 import time
 import requests
 import pandas as pd
-import pandas_ta as ta
+import ta
 import io
 import json
 from datetime import date, datetime, timedelta
@@ -618,18 +618,30 @@ if st.session_state.bot_active and ACCESS_TOKEN:
         st.rerun()
 
     # ── Indicators ────────────────────────────────────────────────────────────
-    df["EMA_9"]   = ta.ema(df["close"], length=9)
-    df["EMA_21"]  = ta.ema(df["close"], length=21)
-    df["Vol_SMA"] = ta.sma(df["volume"], length=20)
-    df["RSI_14"]  = ta.rsi(df["close"], length=14)
-    df["VWAP"]    = compute_vwap(df)
+    df["EMA_9"]        = ta.trend.ema_indicator(df["close"], window=9)
+    df["EMA_21"]       = ta.trend.ema_indicator(df["close"], window=21)
+    df["Vol_SMA"]      = df["volume"].rolling(window=20).mean()
+    df["RSI_14"]       = ta.momentum.rsi(df["close"], window=14)
+    df["ADX"]          = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
+    
+    def compute_supertrend(df: pd.DataFrame, length: int = 7, multiplier: float = 3.0) -> pd.Series:
+    hl_avg = (df["high"] + df["low"]) / 2
+    atr    = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=length)
+    upper  = hl_avg + multiplier * atr
+    lower  = hl_avg - multiplier * atr
+    
+    direction = pd.Series(1, index=df.index)
+    for i in range(1, len(df)):
+        if df["close"].iloc[i] > upper.iloc[i - 1]:
+            direction.iloc[i] = 1
+        elif df["close"].iloc[i] < lower.iloc[i - 1]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i - 1]
+    return direction
 
-    adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
-    df["ADX"] = adx_df["ADX_14"]
-
-    st_df = ta.supertrend(df["high"], df["low"], df["close"], length=7, multiplier=3)
-    df["ST_Direction"] = st_df["SUPERTd_7_3.0"]
-
+    df["ST_Direction"] = compute_supertrend(df)
+    
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
