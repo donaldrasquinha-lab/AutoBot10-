@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 # CONFIGURATION CONSTANTS
 # ==============================================================================
 UPSTOX_BASE_URL   = "https://api.upstox.com/v2"
-NIFTY_LOT_SIZE    = 75          # Update if SEBI revises
+NIFTY_LOT_SIZE    = 65          # Update if SEBI revises
 MAX_LOSS_STREAK   = 2           # Consecutive losses before circuit breaker trips
 OI_SURGE_RATIO    = 1.5         # OI must be ≥ this multiple of 5-bar OI average
 INSTRUMENT_MASTER_URL = (
