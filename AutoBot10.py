@@ -239,7 +239,23 @@ def fetch_historical_candles(token: str, instrument_key: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
+def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
+    """
+    Fetches VWAP directly from Upstox /market-quote/ohlc.
+    Returns the vwap float, or None on failure.
+    """
+    url  = f"{UPSTOX_BASE_URL}/market-quote/ohlc"
+    data = api_get(token, url, params={
+        "instrument_key": instrument_key,
+        "interval": "1d"   # intraday VWAP for today
+    })
+    if data is None:
+        return None
+    try:
+        normalized = instrument_key.replace("|", ":")
+        return float(data["data"][normalized]["ohlc"]["vwap"])
+    except (KeyError, TypeError, ValueError):
+        return None
 live_vwap = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
 df["VWAP"] = live_vwap if live_vwap else df["close"]  # fallback to close
 
