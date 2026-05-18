@@ -241,19 +241,22 @@ def fetch_historical_candles(token: str, instrument_key: str) -> pd.DataFrame:
 
 def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
     """
-    Fetches VWAP directly from Upstox /market-quote/ohlc.
-    Returns the vwap float, or None on failure.
+    Fetches session VWAP from /market-quote/ohlc.
+    Returns None if the key is missing or market is closed.
     """
+    if not token:
+        return None
     url  = f"{UPSTOX_BASE_URL}/market-quote/ohlc"
     data = api_get(token, url, params={
         "instrument_key": instrument_key,
-        "interval": "1d"   # intraday VWAP for today
+        "interval": "1d"
     })
-    if data is None:
+    if not data:
         return None
     try:
         normalized = instrument_key.replace("|", ":")
-        return float(data["data"][normalized]["ohlc"]["vwap"])
+        vwap = data["data"][normalized]["ohlc"].get("vwap")
+        return float(vwap) if vwap else None
     except (KeyError, TypeError, ValueError):
         return None
         
@@ -654,9 +657,20 @@ if st.session_state.bot_active and ACCESS_TOKEN:
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-
+ # ── VWAP resolution (ADD THIS BLOCK HERE) ─────────────────────────────
     live_vwap = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
-    df["VWAP"] = live_vwap if live_vwap else df["close"]  # fallback to close  
+
+    if live_vwap and live_vwap > 0:
+        vwap_value = live_vwap
+    else:
+        tp          = (df["high"] + df["low"] + df["close"]) / 3
+        cum_tpv     = (tp * df["volume"]).cumsum()
+        cum_vol     = df["volume"].cumsum().replace(0, float("nan"))
+        vwap_series = cum_tpv / cum_vol
+        last_vwap   = vwap_series.dropna().iloc[-1] if not vwap_series.dropna().empty else None
+        vwap_value  = float(last_vwap) if last_vwap else float(df["close"].iloc[-1])
+
+    last_close = float(last["close"])
 
     # ── OI snapshot (every cycle) ─────────────────────────────────────────────
     spot_ref = nifty_spot or float(last["close"])
