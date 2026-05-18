@@ -633,8 +633,6 @@ if st.session_state.bot_active and ACCESS_TOKEN:
     df["RSI_14"]       = ta.momentum.rsi(df["close"], window=14)
     df["ADX"]          = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
 
-live_vwap = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
-df["VWAP"] = live_vwap if live_vwap else df["close"]  # fallback to close    
     def compute_supertrend(df: pd.DataFrame, length: int = 7, multiplier: float = 3.0) -> pd.Series:
       hl_avg = (df["high"] + df["low"]) / 2
       atr    = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=length)
@@ -655,6 +653,10 @@ df["VWAP"] = live_vwap if live_vwap else df["close"]  # fallback to close
     
     last = df.iloc[-1]
     prev = df.iloc[-2]
+
+
+    live_vwap = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
+    df["VWAP"] = live_vwap if live_vwap else df["close"]  # fallback to close  
 
     # ── OI snapshot (every cycle) ─────────────────────────────────────────────
     spot_ref = nifty_spot or float(last["close"])
