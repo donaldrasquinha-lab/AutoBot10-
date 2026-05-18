@@ -240,12 +240,8 @@ def fetch_historical_candles(token: str, instrument_key: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def compute_vwap(df: pd.DataFrame) -> pd.Series:
-    """Standard intraday cumulative VWAP."""
-    tp      = (df["high"] + df["low"] + df["close"]) / 3
-    cum_tpv = (tp * df["volume"]).cumsum()
-    cum_vol = df["volume"].cumsum()
-    return cum_tpv / cum_vol.replace(0, float("nan"))
+live_vwap = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
+df["VWAP"] = live_vwap if live_vwap else df["close"]  # fallback to close
 
 
 # ==============================================================================
