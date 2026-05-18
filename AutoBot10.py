@@ -19,31 +19,18 @@ INSTRUMENT_MASTER_URL = (
 )
 
 # ==============================================================================
-# ── LIMITATION 1 FIX: RATE-LIMIT AWARE HTTP CLIENT ──────────────────────────
-# Every outbound API call goes through api_get(). It implements:
-#   • Automatic retry with exponential back-off on 429 / 5xx
-#   • Per-endpoint last-call timestamp to enforce a minimum gap (rate budget)
-#   • Hard cap of MAX_RETRIES attempts before giving up
+# RATE-LIMIT AWARE HTTP CLIENT
 # ==============================================================================
 MAX_RETRIES    = 4
-BASE_BACKOFF_S = 1.0   # seconds; doubles each attempt
-MIN_GAP_S      = 0.25  # 250 ms floor between any two calls to the same path
+BASE_BACKOFF_S = 1.0
+MIN_GAP_S      = 0.25
 
 if "api_last_call" not in st.session_state:
-    st.session_state.api_last_call = {}   # {url_path: epoch_float}
+    st.session_state.api_last_call = {}
 
 
 def api_get(token: str, url: str, params: dict | None = None, timeout: int = 6) -> dict | None:
-    """
-    Rate-limit-aware GET wrapper.
-    Returns parsed JSON dict on success, None on permanent failure.
-    Retries on 429 (using Retry-After header when present) and 5xx,
-    with exponential back-off. Enforces MIN_GAP_S between repeated
-    calls to the same endpoint path.
-    """
-    path = url.split("api.upstox.com")[-1]  # key by path only
-
-    # Enforce minimum inter-call gap for this endpoint
+    path = url.split("api.upstox.com")[-1]
     last = st.session_state.api_last_call.get(path, 0)
     gap  = time.time() - last
     if gap < MIN_GAP_S:
@@ -59,19 +46,15 @@ def api_get(token: str, url: str, params: dict | None = None, timeout: int = 6) 
 
             if res.status_code == 200:
                 return res.json()
-
             if res.status_code == 429:
                 retry_after = float(res.headers.get("Retry-After", delay))
                 time.sleep(retry_after)
                 delay *= 2
                 continue
-
             if res.status_code >= 500:
                 time.sleep(delay)
                 delay *= 2
                 continue
-
-            # 4xx (not 429) — client error, no point retrying
             return None
 
         except requests.exceptions.Timeout:
@@ -80,26 +63,14 @@ def api_get(token: str, url: str, params: dict | None = None, timeout: int = 6) 
         except Exception:
             return None
 
-    return None   # exhausted retries
+    return None
 
 
 # ==============================================================================
-# ── LIMITATION 2 FIX: INSTRUMENT MASTER — RELIABLE KEY RESOLUTION ───────────
-# Rather than guessing instrument keys from date formulae, we:
-#   1. Download and cache the NSE instrument master (JSON.gz) once per session.
-#   2. Build an index keyed by (expiry_date, strike, option_type).
-#   3. Resolve ATM key by looking up the real nearest weekly expiry
-#      from the master — handles holiday expiry rollovers automatically.
-#   4. Walk ±strikes from ATM until a live LTP confirms the key is tradeable.
-#   5. Formula-based fallback if the master download fails.
+# INSTRUMENT MASTER — RELIABLE KEY RESOLUTION
 # ==============================================================================
 
 def load_instrument_master() -> pd.DataFrame:
-    """
-    Downloads and caches the Upstox NSE instrument master.
-    Returns a DataFrame filtered to NIFTY weekly options only.
-    Falls back to an empty DataFrame on download failure.
-    """
     if "instrument_master" in st.session_state:
         return st.session_state.instrument_master
 
@@ -110,7 +81,6 @@ def load_instrument_master() -> pd.DataFrame:
         df = pd.DataFrame(instruments)
         df.columns = [c.lower().replace(" ", "_") for c in df.columns]
 
-        # Filter to NIFTY F&O options only
         df = df[
             (df["name"].str.upper() == "NIFTY") &
             (df["instrument_type"].str.upper().isin(["CE", "PE"])) &
@@ -134,7 +104,6 @@ def load_instrument_master() -> pd.DataFrame:
 
 
 def get_weekly_expiries(master: pd.DataFrame) -> list[date]:
-    """Returns sorted list of upcoming expiry dates from the master."""
     today    = date.today()
     expiries = sorted(master["expiry_date"].dropna().unique())
     return [e for e in expiries if e >= today]
@@ -146,13 +115,6 @@ def resolve_atm_option_key(
     option_type: str,
     master: pd.DataFrame,
 ) -> tuple[str, str]:
-    """
-    Resolves the ATM Nifty option instrument key.
-
-    1. Tries instrument master → nearest weekly expiry → walk strikes from ATM.
-    2. Validates each candidate with a live LTP fetch.
-    3. Falls back to the date-formula approach if the master is empty.
-    """
     atm_strike = round(spot / 50) * 50
     ot         = option_type.upper()
 
@@ -191,7 +153,6 @@ def resolve_atm_option_key(
 # ==============================================================================
 
 def fetch_ltp(token: str, instrument_key: str) -> float | None:
-    """Fetches LTP via /v2/market-quote/ltp. Routes through api_get()."""
     url  = f"{UPSTOX_BASE_URL}/market-quote/ltp"
     data = api_get(token, url, params={"instrument_key": instrument_key})
     if data is None:
@@ -204,7 +165,6 @@ def fetch_ltp(token: str, instrument_key: str) -> float | None:
 
 
 def fetch_ltp_batch(token: str, instrument_keys: list[str]) -> dict:
-    """Batch-fetches LTPs for any number of keys (auto-chunked to 50 per call)."""
     results = {}
     for i in range(0, len(instrument_keys), 50):
         batch = instrument_keys[i : i + 50]
@@ -222,7 +182,6 @@ def fetch_ltp_batch(token: str, instrument_keys: list[str]) -> dict:
 
 
 def fetch_historical_candles(token: str, instrument_key: str) -> pd.DataFrame:
-    """Fetches today's 1-minute intraday OHLCV+OI candles."""
     url  = f"{UPSTOX_BASE_URL}/historical-candle/intraday/{instrument_key}/1minute"
     data = api_get(token, url)
     if data is None:
@@ -239,10 +198,11 @@ def fetch_historical_candles(token: str, instrument_key: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+
 def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
     """
-    Fetches session VWAP from /market-quote/ohlc.
-    Returns None if the key is missing or market is closed.
+    Fetches session VWAP directly from /market-quote/ohlc.
+    Returns a plain float, or None if unavailable (pre-market, closed, etc).
     """
     if not token:
         return None
@@ -259,20 +219,13 @@ def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
         return float(vwap) if vwap else None
     except (KeyError, TypeError, ValueError):
         return None
-        
+
+
 # ==============================================================================
-# ── LIMITATION 3 FIX: OPTION CHAIN OI DATA ──────────────────────────────────
-# Fetches live OI at the ATM strike from the Upstox option chain endpoint.
-# Computes PCR, OI change vs previous snapshot, and OI surge flag (current OI
-# vs trailing 5-bar average). Both are used as confluence filters in the signal.
+# OPTION CHAIN OI DATA
 # ==============================================================================
 
 def fetch_option_chain_oi(token: str, spot: float) -> dict:
-    """
-    Fetches option chain OI for the nearest weekly NIFTY expiry at the ATM
-    strike. Returns a dict with: atm_strike, ce_oi, pe_oi, pcr,
-    ce_oi_chg, pe_oi_chg, oi_surge_ce, oi_surge_pe.
-    """
     atm_strike = round(spot / 50) * 50
 
     master   = st.session_state.get("instrument_master", pd.DataFrame())
@@ -335,27 +288,18 @@ def fetch_option_chain_oi(token: str, spot: float) -> dict:
 
 
 # ==============================================================================
-# ── LIMITATION 4 FIX: ORDER ROUTING ─────────────────────────────────────────
-# place_order() calls the Upstox V2 /order/place endpoint in Live mode.
-# In Paper mode it skips the API call and returns a simulated order ID.
-# Retries on 429 with Retry-After header. Hard-rejects on 4xx order errors.
-# All placements (live and paper) are written to session_state.order_log
-# for a full intra-session audit trail.
+# ORDER ROUTING
 # ==============================================================================
 
 def place_order(
     token:            str,
     instrument_key:   str,
-    transaction_type: str,    # "BUY" | "SELL"
+    transaction_type: str,
     quantity:         int,
     order_type:       str   = "MARKET",
     price:            float = 0.0,
     paper_mode:       bool  = True,
 ) -> str | None:
-    """
-    Places a Upstox V2 market/limit order or simulates one in Paper mode.
-    Returns order_id on success, None on failure.
-    """
     sim_id = f"PAPER-{datetime.now().strftime('%H%M%S%f')}"
 
     if paper_mode:
@@ -367,7 +311,6 @@ def place_order(
         })
         return sim_id
 
-    # ── Live placement ───────────────────────────────────────────────────
     url     = f"{UPSTOX_BASE_URL}/order/place"
     headers = {
         "Accept":        "application/json",
@@ -376,7 +319,7 @@ def place_order(
     }
     payload = {
         "quantity":           quantity,
-        "product":            "I",        # Intraday (MIS)
+        "product":            "I",
         "validity":           "DAY",
         "price":              price if order_type == "LIMIT" else 0,
         "tag":                "SCALPER",
@@ -409,7 +352,6 @@ def place_order(
                 delay *= 2
                 continue
 
-            # Non-retriable client error
             err = res.json().get("errors", [{}])[0].get("message", res.text)
             st.error(f"🚨 Order rejected ({res.status_code}): {err}")
             return None
@@ -430,10 +372,6 @@ def exit_position(
     paper_mode:  bool,
     lot_size:    int,
 ) -> None:
-    """
-    Unified exit: places SELL order → updates PnL → appends trade log
-    → manages loss streak / circuit breaker.
-    """
     order_id  = place_order(token, pos["key"], "SELL", lot_size,
                             order_type="MARKET", paper_mode=paper_mode)
     trade_pnl = (exit_price - pos["entry_price"]) * lot_size
@@ -501,7 +439,7 @@ ACCESS_TOKEN = st.sidebar.text_input(
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Strategy Parameters")
 INITIAL_CAPITAL = st.sidebar.number_input("Starting Capital (₹)", value=50_000, step=5_000)
-STOP_LOSS_PCT   = st.sidebar.slider("Stop Loss (%)",    1, 10, 6)  / 100.0
+STOP_LOSS_PCT   = st.sidebar.slider("Stop Loss (%)",     1, 10, 6)  / 100.0
 TARGET_PCT      = st.sidebar.slider("Target Profit (%)", 1, 25, 12) / 100.0
 LOT_SIZE        = st.sidebar.number_input("Lot Size", value=NIFTY_LOT_SIZE, min_value=1, step=1)
 TRADE_MODE      = st.sidebar.radio(
@@ -516,7 +454,6 @@ st.sidebar.caption(f"📊 OI surge threshold: **{OI_SURGE_RATIO}×** 5-bar avera
 
 current_capital = INITIAL_CAPITAL + st.session_state.session_pnl
 
-# Pre-load instrument master once per session
 if ACCESS_TOKEN and "instrument_master" not in st.session_state:
     with st.sidebar:
         with st.spinner("Loading instrument master…"):
@@ -527,7 +464,6 @@ if ACCESS_TOKEN and "instrument_master" not in st.session_state:
 # ==============================================================================
 st.title("🦅 Upstox Options Advanced Scalping Engine")
 
-# ── Row 1: KPI Metrics ────────────────────────────────────────────────────────
 m1, m2, m3, m4, m5 = st.columns(5)
 nifty_spot = fetch_ltp(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") if ACCESS_TOKEN else None
 
@@ -538,13 +474,12 @@ m3.metric(
     f"₹{st.session_state.session_pnl:,.2f}",
     delta=f"{(st.session_state.session_pnl / INITIAL_CAPITAL * 100):.2f}%" if INITIAL_CAPITAL else "0%",
 )
-m4.metric("🛡️ Mode",        "LIVE" if not IS_PAPER else "PAPER")
-m5.metric("🔴 Loss Streak",  f"{st.session_state.loss_streak} / {MAX_LOSS_STREAK}",
+m4.metric("🛡️ Mode",       "LIVE" if not IS_PAPER else "PAPER")
+m5.metric("🔴 Loss Streak", f"{st.session_state.loss_streak} / {MAX_LOSS_STREAK}",
           delta="⚠️ At limit!" if st.session_state.loss_streak >= MAX_LOSS_STREAK - 1 else None)
 
 st.markdown("---")
 
-# ── Row 2: Engine Controls | OI Panel | Active Position ──────────────────────
 col_ctrl, col_oi, col_pos = st.columns([1, 1, 2])
 
 with col_ctrl:
@@ -559,7 +494,6 @@ with col_ctrl:
                 st.rerun()
         else:
             if st.button("🛑 EMERGENCY HALT", type="secondary", use_container_width=True):
-                # Attempt live market-exit before halting
                 if st.session_state.current_position and not IS_PAPER:
                     pos     = st.session_state.current_position
                     ltp_now = fetch_ltp(ACCESS_TOKEN, pos["key"]) or pos["entry_price"]
@@ -630,50 +564,51 @@ if st.session_state.bot_active and ACCESS_TOKEN:
         st.rerun()
 
     # ── Indicators ────────────────────────────────────────────────────────────
-    df["EMA_9"]        = ta.trend.ema_indicator(df["close"], window=9)
-    df["EMA_21"]       = ta.trend.ema_indicator(df["close"], window=21)
-    df["Vol_SMA"]      = df["volume"].rolling(window=20).mean()
-    df["RSI_14"]       = ta.momentum.rsi(df["close"], window=14)
-    df["ADX"]          = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
+    df["EMA_9"]   = ta.trend.ema_indicator(df["close"], window=9)
+    df["EMA_21"]  = ta.trend.ema_indicator(df["close"], window=21)
+    df["Vol_SMA"] = df["volume"].rolling(window=20).mean()
+    df["RSI_14"]  = ta.momentum.rsi(df["close"], window=14)
+    df["ADX"]     = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
 
     def compute_supertrend(df: pd.DataFrame, length: int = 7, multiplier: float = 3.0) -> pd.Series:
-      hl_avg = (df["high"] + df["low"]) / 2
-      atr    = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=length)
-      upper  = hl_avg + multiplier * atr
-      lower  = hl_avg - multiplier * atr
-    
-      direction = pd.Series(1, index=df.index)
-      for i in range(1, len(df)):
-        if df["close"].iloc[i] > upper.iloc[i - 1]:
-            direction.iloc[i] = 1
-        elif df["close"].iloc[i] < lower.iloc[i - 1]:
-            direction.iloc[i] = -1
-        else:
-            direction.iloc[i] = direction.iloc[i - 1]
-      return direction
+        hl_avg = (df["high"] + df["low"]) / 2
+        atr    = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=length)
+        upper  = hl_avg + multiplier * atr
+        lower  = hl_avg - multiplier * atr
+        direction = pd.Series(1, index=df.index)
+        for i in range(1, len(df)):
+            if df["close"].iloc[i] > upper.iloc[i - 1]:
+                direction.iloc[i] = 1
+            elif df["close"].iloc[i] < lower.iloc[i - 1]:
+                direction.iloc[i] = -1
+            else:
+                direction.iloc[i] = direction.iloc[i - 1]
+        return direction
 
     df["ST_Direction"] = compute_supertrend(df)
-    
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
- # ── VWAP resolution (ADD THIS BLOCK HERE) ─────────────────────────────
+    # ── VWAP — resolved as a plain float, never assigned to df ───────────────
+    # This avoids KeyError on last["VWAP"] entirely.
     live_vwap = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
 
     if live_vwap and live_vwap > 0:
         vwap_value = live_vwap
     else:
+        # Calculated fallback — extract scalar, do not write to df
         tp          = (df["high"] + df["low"] + df["close"]) / 3
         cum_tpv     = (tp * df["volume"]).cumsum()
         cum_vol     = df["volume"].cumsum().replace(0, float("nan"))
         vwap_series = cum_tpv / cum_vol
-        last_vwap   = vwap_series.dropna().iloc[-1] if not vwap_series.dropna().empty else None
-        vwap_value  = float(last_vwap) if last_vwap else float(df["close"].iloc[-1])
+        valid       = vwap_series.dropna()
+        vwap_value  = float(valid.iloc[-1]) if not valid.empty else float(last["close"])
 
     last_close = float(last["close"])
 
-    # ── OI snapshot (every cycle) ─────────────────────────────────────────────
-    spot_ref = nifty_spot or float(last["close"])
+    # ── OI snapshot ───────────────────────────────────────────────────────────
+    spot_ref = nifty_spot or last_close
     oi       = fetch_option_chain_oi(ACCESS_TOKEN, spot_ref)
     master   = load_instrument_master()
 
@@ -682,12 +617,15 @@ if st.session_state.bot_active and ACCESS_TOKEN:
         ema_bull = (prev["EMA_9"] <= prev["EMA_21"]) and (last["EMA_9"] > last["EMA_21"])
         ema_bear = (prev["EMA_9"] >= prev["EMA_21"]) and (last["EMA_9"] < last["EMA_21"])
 
-        is_trending        = last["ADX"]    > 25
-        is_high_vol        = last["volume"] > last["Vol_SMA"]
-        above_vwap         = last["close"]  > last["VWAP"]
-        below_vwap         = last["close"]  < last["VWAP"]
-        oi_confirms_call   = oi["oi_surge_ce"] or (oi["pcr"] > 1.0)
-        oi_confirms_put    = oi["oi_surge_pe"] or (oi["pcr"] < 1.0)
+        is_trending      = last["ADX"]    > 25
+        is_high_vol      = last["volume"] > last["Vol_SMA"]
+
+        # ✅ Use vwap_value (plain float) — not last["VWAP"]
+        above_vwap       = last_close > vwap_value
+        below_vwap       = last_close < vwap_value
+
+        oi_confirms_call = oi["oi_surge_ce"] or (oi["pcr"] > 1.0)
+        oi_confirms_put  = oi["oi_surge_pe"] or (oi["pcr"] < 1.0)
 
         call_signal = (
             ema_bull and is_trending and is_high_vol
@@ -740,7 +678,6 @@ if st.session_state.bot_active and ACCESS_TOKEN:
         if pos_ltp is None:
             st.warning("⚠️ LTP fetch failed — retrying next cycle.")
         else:
-            # Trailing SL ratchet (only moves up)
             if pos_ltp > pos["highest_price"]:
                 st.session_state.current_position["highest_price"] = pos_ltp
                 new_sl = pos_ltp * (1 - STOP_LOSS_PCT)
@@ -788,7 +725,6 @@ if st.session_state.trade_logs:
 else:
     st.info("No trades executed this session.")
 
-# ── Raw Order Log (audit trail) ───────────────────────────────────────────────
 if st.session_state.order_log:
     with st.expander("🗂️ Raw Order Log"):
         st.dataframe(pd.DataFrame(st.session_state.order_log), use_container_width=True)
