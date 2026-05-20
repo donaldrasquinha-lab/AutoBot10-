@@ -3,20 +3,35 @@ import time
 import requests
 import pandas as pd
 import ta
-import io
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 # ==============================================================================
 # CONFIGURATION CONSTANTS
 # ==============================================================================
-UPSTOX_BASE_URL   = "https://api.upstox.com/v2"
-NIFTY_LOT_SIZE    = 65          # Update if SEBI revises
-MAX_LOSS_STREAK   = 2           # Consecutive losses before circuit breaker trips
-OI_SURGE_RATIO    = 1.5         # OI must be ≥ this multiple of 5-bar OI average
-INSTRUMENT_MASTER_URL = (
-    "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-)
+UPSTOX_BASE_URL       = "https://api.upstox.com/v2"
+NIFTY_LOT_SIZE        = 65
+MAX_LOSS_STREAK       = 2
+OI_SURGE_RATIO        = 1.5
+SLIPPAGE_PER_SIDE     = 1.5      # ₹ per unit per side
+IST                   = timezone(timedelta(hours=5, minutes=30))
+INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+
+# ── Risk guardrails defaults ──────────────────────────────────────────────────
+DEFAULT_MAX_DAILY_LOSS = 5000
+DEFAULT_MAX_TRADES     = 5
+DEFAULT_STOP_LOSS_PCT  = 6
+DEFAULT_TARGET_PCT     = 12
+DEFAULT_RR_MIN         = 1.5
+
+# ── Prime trading windows in IST ──────────────────────────────────────────────
+PRIME_WINDOWS = [
+    ("09:30", "11:30"),
+    ("13:30", "14:45"),
+]
+
+# ── Signal persistence: bars a condition must hold before entry ───────────────
+SIGNAL_HOLD_BARS = 2   # EMA crossover must sustain for this many consecutive bars
 
 # ==============================================================================
 # RATE-LIMIT AWARE HTTP CLIENT
@@ -29,10 +44,10 @@ if "api_last_call" not in st.session_state:
     st.session_state.api_last_call = {}
 
 
-def api_get(token: str, url: str, params: dict | None = None, timeout: int = 6) -> dict | None:
-    path = url.split("api.upstox.com")[-1]
-    last = st.session_state.api_last_call.get(path, 0)
-    gap  = time.time() - last
+def api_get(token: str, url: str, params: dict | None = None, timeout: int = 8) -> dict | None:
+    """Rate-limit-aware GET with exponential backoff on 429/5xx."""
+    path  = url.split("api.upstox.com")[-1]
+    gap   = time.time() - st.session_state.api_last_call.get(path, 0)
     if gap < MIN_GAP_S:
         time.sleep(MIN_GAP_S - gap)
 
@@ -43,62 +58,95 @@ def api_get(token: str, url: str, params: dict | None = None, timeout: int = 6) 
         try:
             st.session_state.api_last_call[path] = time.time()
             res = requests.get(url, headers=headers, params=params, timeout=timeout)
-
             if res.status_code == 200:
                 return res.json()
             if res.status_code == 429:
-                retry_after = float(res.headers.get("Retry-After", delay))
-                time.sleep(retry_after)
+                time.sleep(float(res.headers.get("Retry-After", delay)))
                 delay *= 2
                 continue
             if res.status_code >= 500:
                 time.sleep(delay)
                 delay *= 2
                 continue
+            # Log non-retriable errors to session state for the debug panel
+            st.session_state.setdefault("api_errors", []).append({
+                "time": now_ist().strftime("%H:%M:%S"),
+                "url": url, "status": res.status_code,
+                "body": res.text[:200],
+            })
             return None
-
         except requests.exceptions.Timeout:
             time.sleep(delay)
             delay *= 2
-        except Exception:
+        except Exception as e:
+            st.session_state.setdefault("api_errors", []).append({
+                "time": now_ist().strftime("%H:%M:%S"),
+                "url": url, "status": "exception", "body": str(e),
+            })
             return None
-
     return None
 
 
 # ==============================================================================
-# INSTRUMENT MASTER — RELIABLE KEY RESOLUTION
+# IST TIME HELPERS
+# ── FIX: Streamlit Cloud runs UTC. All time comparisons use IST explicitly.
+# ==============================================================================
+
+def now_ist() -> datetime:
+    """Current datetime in IST regardless of server timezone."""
+    return datetime.now(tz=IST)
+
+
+def in_prime_session() -> bool:
+    """True if current IST time is inside a prime trading window."""
+    now = now_ist().time()
+    for start_str, end_str in PRIME_WINDOWS:
+        start = datetime.strptime(start_str, "%H:%M").time()
+        end   = datetime.strptime(end_str,   "%H:%M").time()
+        if start <= now <= end:
+            return True
+    return False
+
+
+def next_window_str() -> str:
+    now = now_ist().time()
+    for start_str, end_str in PRIME_WINDOWS:
+        start = datetime.strptime(start_str, "%H:%M").time()
+        if now < start:
+            return f"{start_str} – {end_str} IST"
+    return "09:30 IST tomorrow"
+
+
+def ist_time_str() -> str:
+    return now_ist().strftime("%H:%M:%S IST")
+
+
+# ==============================================================================
+# INSTRUMENT MASTER
 # ==============================================================================
 
 def load_instrument_master() -> pd.DataFrame:
     if "instrument_master" in st.session_state:
         return st.session_state.instrument_master
-
     try:
         res = requests.get(INSTRUMENT_MASTER_URL, timeout=20)
         res.raise_for_status()
-        instruments = res.json()
-        df = pd.DataFrame(instruments)
+        df  = pd.DataFrame(res.json())
         df.columns = [c.lower().replace(" ", "_") for c in df.columns]
-
         df = df[
             (df["name"].str.upper() == "NIFTY") &
             (df["instrument_type"].str.upper().isin(["CE", "PE"])) &
             (df["segment"].str.upper() == "NSE_FO")
         ].copy()
-
         df["expiry_date"] = pd.to_datetime(df["expiry"], dayfirst=True).dt.date
         df["strike"]      = pd.to_numeric(df["strike_price"], errors="coerce")
         df["option_type"] = df["instrument_type"].str.upper()
-
         st.session_state.instrument_master = df
         return df
-
     except Exception as e:
         st.warning(f"⚠️ Instrument master load failed: {e}. Using formula fallback.")
-        empty = pd.DataFrame(columns=[
-            "instrument_key", "trading_symbol", "expiry_date", "strike", "option_type"
-        ])
+        empty = pd.DataFrame(columns=["instrument_key", "trading_symbol",
+                                       "expiry_date", "strike", "option_type"])
         st.session_state.instrument_master = empty
         return empty
 
@@ -109,42 +157,31 @@ def get_weekly_expiries(master: pd.DataFrame) -> list[date]:
     return [e for e in expiries if e >= today]
 
 
-def resolve_atm_option_key(
-    token: str,
-    spot: float,
-    option_type: str,
-    master: pd.DataFrame,
-) -> tuple[str, str]:
+def resolve_atm_option_key(token: str, spot: float, option_type: str,
+                            master: pd.DataFrame) -> tuple[str, str]:
     atm_strike = round(spot / 50) * 50
     ot         = option_type.upper()
-
     if not master.empty:
         expiries = get_weekly_expiries(master)
         if expiries:
-            nearest = expiries[0]
             candidates = master[
-                (master["expiry_date"] == nearest) &
+                (master["expiry_date"] == expiries[0]) &
                 (master["option_type"] == ot) &
                 (master["strike"].between(atm_strike - 200, atm_strike + 200))
             ].copy()
             candidates["dist"] = (candidates["strike"] - atm_strike).abs()
-            candidates = candidates.sort_values("dist")
-
-            for _, row in candidates.iterrows():
-                ikey    = row["instrument_key"]
-                isymbol = row.get("trading_symbol", ikey)
-                ltp     = fetch_ltp(token, ikey)
+            for _, row in candidates.sort_values("dist").iterrows():
+                ikey = row["instrument_key"]
+                ltp  = fetch_ltp(token, ikey)
                 if ltp is not None and ltp > 0:
-                    return ikey, isymbol
-
+                    return ikey, row.get("trading_symbol", ikey)
     # Formula fallback
     today            = date.today()
     days_to_thursday = (3 - today.weekday()) % 7
-    if days_to_thursday == 0 and datetime.now().hour >= 15:
+    if days_to_thursday == 0 and now_ist().hour >= 15:
         days_to_thursday = 7
-    expiry     = today + timedelta(days=days_to_thursday)
-    expiry_str = expiry.strftime("%y%b%d").upper()
-    symbol     = f"NIFTY{expiry_str}{atm_strike}{ot}"
+    expiry = today + timedelta(days=days_to_thursday)
+    symbol = f"NIFTY{expiry.strftime('%y%b%d').upper()}{atm_strike}{ot}"
     return f"NSE_FO|{symbol}", symbol
 
 
@@ -153,13 +190,12 @@ def resolve_atm_option_key(
 # ==============================================================================
 
 def fetch_ltp(token: str, instrument_key: str) -> float | None:
-    url  = f"{UPSTOX_BASE_URL}/market-quote/ltp"
-    data = api_get(token, url, params={"instrument_key": instrument_key})
+    data = api_get(token, f"{UPSTOX_BASE_URL}/market-quote/ltp",
+                   params={"instrument_key": instrument_key})
     if data is None:
         return None
     try:
-        normalized = instrument_key.replace("|", ":")
-        return float(data["data"][normalized]["last_price"])
+        return float(data["data"][instrument_key.replace("|", ":")]["last_price"])
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -168,29 +204,28 @@ def fetch_ltp_batch(token: str, instrument_keys: list[str]) -> dict:
     results = {}
     for i in range(0, len(instrument_keys), 50):
         batch = instrument_keys[i : i + 50]
-        url   = f"{UPSTOX_BASE_URL}/market-quote/ltp"
-        data  = api_get(token, url, params={"instrument_key": ",".join(batch)})
+        data  = api_get(token, f"{UPSTOX_BASE_URL}/market-quote/ltp",
+                        params={"instrument_key": ",".join(batch)})
         if data is None:
             continue
         for raw_key, val in data.get("data", {}).items():
-            original = raw_key.replace(":", "|")
             try:
-                results[original] = float(val["last_price"])
+                results[raw_key.replace(":", "|")] = float(val["last_price"])
             except (KeyError, TypeError, ValueError):
                 continue
     return results
 
 
-def fetch_historical_candles(token: str, instrument_key: str) -> pd.DataFrame:
-    url  = f"{UPSTOX_BASE_URL}/historical-candle/intraday/{instrument_key}/1minute"
+def fetch_historical_candles(token: str, instrument_key: str,
+                              interval: str = "1minute") -> pd.DataFrame:
+    url  = f"{UPSTOX_BASE_URL}/historical-candle/intraday/{instrument_key}/{interval}"
     data = api_get(token, url)
     if data is None:
         return pd.DataFrame()
     try:
         candles = data["data"]["candles"]
-        df = pd.DataFrame(
-            candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"]
-        )
+        df = pd.DataFrame(candles,
+                          columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
         df = df.iloc[::-1].reset_index(drop=True)
         for col in ["open", "high", "low", "close", "volume", "oi"]:
             df[col] = pd.to_numeric(df[col])
@@ -200,52 +235,63 @@ def fetch_historical_candles(token: str, instrument_key: str) -> pd.DataFrame:
 
 
 def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
-    """
-    Fetches session VWAP directly from /market-quote/ohlc.
-    Returns a plain float, or None if unavailable (pre-market, closed, etc).
-    """
     if not token:
         return None
-    url  = f"{UPSTOX_BASE_URL}/market-quote/ohlc"
-    data = api_get(token, url, params={
-        "instrument_key": instrument_key,
-        "interval": "1d"
-    })
+    data = api_get(token, f"{UPSTOX_BASE_URL}/market-quote/ohlc",
+                   params={"instrument_key": instrument_key, "interval": "1d"})
     if not data:
         return None
     try:
-        normalized = instrument_key.replace("|", ":")
-        vwap = data["data"][normalized]["ohlc"].get("vwap")
+        vwap = data["data"][instrument_key.replace("|", ":")]["ohlc"].get("vwap")
         return float(vwap) if vwap else None
     except (KeyError, TypeError, ValueError):
         return None
 
 
 # ==============================================================================
-# OPTION CHAIN OI DATA
+# OPTION CHAIN OI
+# ── FIX 1: instrument_key for index uses correct Upstox format
+# ── FIX 2: OI fetch now runs once at startup (not only inside loop)
+#           so the OI panel always has data when bot is active
+# ── FIX 3: oi_confirms fallback is True (not False) when OI API is down,
+#           so OI fetch failure no longer silently blocks all entries
 # ==============================================================================
 
 def fetch_option_chain_oi(token: str, spot: float) -> dict:
+    """
+    Fetches ATM OI from /v2/option/chain.
+    Returns neutral defaults with oi_confirms=True if the API fails,
+    so a temporary OI outage does not block all entries.
+    """
     atm_strike = round(spot / 50) * 50
-
-    master   = st.session_state.get("instrument_master", pd.DataFrame())
-    expiries = get_weekly_expiries(master) if not master.empty else []
+    master     = st.session_state.get("instrument_master", pd.DataFrame())
+    expiries   = get_weekly_expiries(master) if not master.empty else []
     if expiries:
         expiry_str = expiries[0].strftime("%Y-%m-%d")
     else:
         today            = date.today()
         days_to_thursday = (3 - today.weekday()) % 7
-        if days_to_thursday == 0 and datetime.now().hour >= 15:
+        if days_to_thursday == 0 and now_ist().hour >= 15:
             days_to_thursday = 7
         expiry_str = (today + timedelta(days=days_to_thursday)).strftime("%Y-%m-%d")
 
-    url    = f"{UPSTOX_BASE_URL}/option/chain"
-    params = {"instrument_key": "NSE_INDEX|Nifty 50", "expiry_date": expiry_str}
-    data   = api_get(token, url, params=params)
+    # ── FIX: correct instrument_key for Nifty index ───────────────────────────
+    data = api_get(token, f"{UPSTOX_BASE_URL}/option/chain",
+                   params={"instrument_key": "NSE_INDEX|Nifty%2050",
+                            "expiry_date": expiry_str})
 
+    # Fallback: if URL-encoding didn't help, try plain string
+    if data is None:
+        data = api_get(token, f"{UPSTOX_BASE_URL}/option/chain",
+                       params={"instrument_key": "NSE_INDEX|Nifty 50",
+                                "expiry_date": expiry_str})
+
+    # ── FIX: neutral defaults with oi_confirms=True so OI failure ≠ no trade ──
     empty = {
         "atm_strike": atm_strike, "ce_oi": 0, "pe_oi": 0, "pcr": 1.0,
-        "ce_oi_chg": 0, "pe_oi_chg": 0, "oi_surge_ce": False, "oi_surge_pe": False,
+        "ce_oi_chg": 0, "pe_oi_chg": 0,
+        "oi_surge_ce": False, "oi_surge_pe": False,
+        "oi_available": False,   # flag: False = API failed, use relaxed gate
     }
     if data is None:
         return empty
@@ -253,35 +299,27 @@ def fetch_option_chain_oi(token: str, spot: float) -> dict:
     try:
         chain   = data["data"]
         atm_row = min(chain, key=lambda r: abs(float(r.get("strike_price", 0)) - atm_strike))
-
-        ce_oi = float(atm_row.get("call_options", {}).get("market_data", {}).get("oi", 0))
-        pe_oi = float(atm_row.get("put_options",  {}).get("market_data", {}).get("oi", 0))
-        pcr   = (pe_oi / ce_oi) if ce_oi > 0 else 1.0
-
-        prev      = st.session_state.get("oi_snapshot", {})
-        ce_oi_chg = ce_oi - prev.get("ce_oi", ce_oi)
-        pe_oi_chg = pe_oi - prev.get("pe_oi", pe_oi)
-
+        ce_oi   = float(atm_row.get("call_options", {}).get("market_data", {}).get("oi", 0))
+        pe_oi   = float(atm_row.get("put_options",  {}).get("market_data", {}).get("oi", 0))
+        pcr     = (pe_oi / ce_oi) if ce_oi > 0 else 1.0
+        prev    = st.session_state.get("oi_snapshot", {})
         history = st.session_state.get("oi_history", [])
-        if len(history) >= 5:
-            avg_ce = sum(h["ce_oi"] for h in history[-5:]) / 5
-            avg_pe = sum(h["pe_oi"] for h in history[-5:]) / 5
-        else:
-            avg_ce, avg_pe = ce_oi, pe_oi
-
-        oi_surge_ce = ce_oi >= OI_SURGE_RATIO * avg_ce if avg_ce > 0 else False
-        oi_surge_pe = pe_oi >= OI_SURGE_RATIO * avg_pe if avg_pe > 0 else False
-
+        avg_ce, avg_pe = (
+            (sum(h["ce_oi"] for h in history[-5:]) / 5,
+             sum(h["pe_oi"] for h in history[-5:]) / 5)
+            if len(history) >= 5 else (ce_oi, pe_oi)
+        )
         st.session_state.oi_snapshot = {"ce_oi": ce_oi, "pe_oi": pe_oi}
         history.append({"ce_oi": ce_oi, "pe_oi": pe_oi})
         st.session_state.oi_history = history[-20:]
-
         return {
             "atm_strike":  float(atm_row.get("strike_price", atm_strike)),
-            "ce_oi":       ce_oi,  "pe_oi":      pe_oi,
-            "pcr":         pcr,    "ce_oi_chg":  ce_oi_chg,
-            "pe_oi_chg":   pe_oi_chg,
-            "oi_surge_ce": oi_surge_ce, "oi_surge_pe": oi_surge_pe,
+            "ce_oi": ce_oi, "pe_oi": pe_oi, "pcr": pcr,
+            "ce_oi_chg":   ce_oi - prev.get("ce_oi", ce_oi),
+            "pe_oi_chg":   pe_oi - prev.get("pe_oi", pe_oi),
+            "oi_surge_ce": ce_oi >= OI_SURGE_RATIO * avg_ce if avg_ce > 0 else False,
+            "oi_surge_pe": pe_oi >= OI_SURGE_RATIO * avg_pe if avg_pe > 0 else False,
+            "oi_available": True,
         }
     except Exception:
         return empty
@@ -291,20 +329,13 @@ def fetch_option_chain_oi(token: str, spot: float) -> dict:
 # ORDER ROUTING
 # ==============================================================================
 
-def place_order(
-    token:            str,
-    instrument_key:   str,
-    transaction_type: str,
-    quantity:         int,
-    order_type:       str   = "MARKET",
-    price:            float = 0.0,
-    paper_mode:       bool  = True,
-) -> str | None:
-    sim_id = f"PAPER-{datetime.now().strftime('%H%M%S%f')}"
-
+def place_order(token: str, instrument_key: str, transaction_type: str,
+                quantity: int, order_type: str = "MARKET",
+                price: float = 0.0, paper_mode: bool = True) -> str | None:
+    sim_id = f"PAPER-{now_ist().strftime('%H%M%S%f')}"
     if paper_mode:
         st.session_state.setdefault("order_log", []).append({
-            "time": datetime.now().isoformat(), "mode": "PAPER",
+            "time": now_ist().isoformat(), "mode": "PAPER",
             "instrument_key": instrument_key, "type": transaction_type,
             "qty": quantity, "order_type": order_type, "price": price,
             "order_id": sim_id, "status": "SIMULATED",
@@ -312,116 +343,262 @@ def place_order(
         return sim_id
 
     url     = f"{UPSTOX_BASE_URL}/order/place"
-    headers = {
-        "Accept":        "application/json",
-        "Content-Type":  "application/json",
-        "Authorization": f"Bearer {token}",
-    }
+    headers = {"Accept": "application/json", "Content-Type": "application/json",
+               "Authorization": f"Bearer {token}"}
     payload = {
-        "quantity":           quantity,
-        "product":            "I",
-        "validity":           "DAY",
-        "price":              price if order_type == "LIMIT" else 0,
-        "tag":                "SCALPER",
-        "instrument_token":   instrument_key,
-        "order_type":         order_type,
-        "transaction_type":   transaction_type,
-        "disclosed_quantity": 0,
-        "trigger_price":      0,
-        "is_amo":             False,
+        "quantity": quantity, "product": "I", "validity": "DAY",
+        "price": price if order_type == "LIMIT" else 0,
+        "tag": "SCALPER", "instrument_token": instrument_key,
+        "order_type": order_type, "transaction_type": transaction_type,
+        "disclosed_quantity": 0, "trigger_price": 0, "is_amo": False,
     }
-
     delay = BASE_BACKOFF_S
     for attempt in range(MAX_RETRIES):
         try:
-            res = requests.post(url, headers=headers,
-                                data=json.dumps(payload), timeout=8)
+            res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=8)
             if res.status_code == 200:
                 order_id = res.json()["data"]["order_id"]
                 st.session_state.setdefault("order_log", []).append({
-                    "time": datetime.now().isoformat(), "mode": "LIVE",
+                    "time": now_ist().isoformat(), "mode": "LIVE",
                     "instrument_key": instrument_key, "type": transaction_type,
                     "qty": quantity, "order_type": order_type, "price": price,
                     "order_id": order_id, "status": "PLACED",
                 })
                 return order_id
-
             if res.status_code == 429:
-                wait = float(res.headers.get("Retry-After", delay))
-                time.sleep(wait)
+                time.sleep(float(res.headers.get("Retry-After", delay)))
                 delay *= 2
                 continue
-
             err = res.json().get("errors", [{}])[0].get("message", res.text)
             st.error(f"🚨 Order rejected ({res.status_code}): {err}")
             return None
-
         except Exception:
             time.sleep(delay)
             delay *= 2
-
     st.error("🚨 Order placement failed after max retries.")
     return None
 
 
-def exit_position(
-    token:       str,
-    pos:         dict,
-    exit_price:  float,
-    exit_reason: str,
-    paper_mode:  bool,
-    lot_size:    int,
-) -> None:
-    order_id  = place_order(token, pos["key"], "SELL", lot_size,
-                            order_type="MARKET", paper_mode=paper_mode)
-    trade_pnl = (exit_price - pos["entry_price"]) * lot_size
-    st.session_state.session_pnl += trade_pnl
+def exit_position(token: str, pos: dict, exit_price: float, exit_reason: str,
+                  paper_mode: bool, lot_size: int) -> None:
+    order_id      = place_order(token, pos["key"], "SELL", lot_size,
+                                order_type="MARKET", paper_mode=paper_mode)
+    gross_pnl     = (exit_price - pos["entry_price"]) * lot_size
+    slippage      = SLIPPAGE_PER_SIDE * 2 * lot_size
+    net_pnl       = gross_pnl - slippage
+    risk_per_unit = abs(pos["entry_price"] - pos["sl_price"])
+    rr_realised   = round(gross_pnl / (risk_per_unit * lot_size), 2) if risk_per_unit > 0 else 0.0
 
+    st.session_state.session_pnl += net_pnl
     st.session_state.trade_logs.append({
-        "Date":          date.today().isoformat(),
-        "Entry Time":    pos["entry_time"],
-        "Exit Time":     datetime.now().strftime("%H:%M:%S"),
-        "Symbol":        pos["symbol"],
-        "Direction":     pos["direction"],
-        "Mode":          "LIVE" if not paper_mode else "PAPER",
-        "Entry ₹":       pos["entry_price"],
-        "Exit ₹":        exit_price,
-        "Peak ₹":        pos["highest_price"],
-        "PnL ₹":         round(trade_pnl, 2),
-        "Exit Reason":   exit_reason,
-        "Entry Order":   pos.get("entry_order_id", "—"),
-        "Exit Order":    order_id or "—",
+        "Date":        date.today().isoformat(),
+        "Entry Time":  pos["entry_time"],
+        "Exit Time":   now_ist().strftime("%H:%M:%S"),
+        "Symbol":      pos["symbol"],
+        "Direction":   pos["direction"],
+        "Mode":        "LIVE" if not paper_mode else "PAPER",
+        "Entry ₹":     pos["entry_price"],
+        "Exit ₹":      exit_price,
+        "Peak ₹":      pos["highest_price"],
+        "SL ₹":        pos["sl_price"],
+        "Target ₹":    pos["target_price"],
+        "Gross PnL ₹": round(gross_pnl, 2),
+        "Slippage ₹":  round(slippage, 2),
+        "Net PnL ₹":   round(net_pnl, 2),
+        "RR Realised": rr_realised,
+        "Exit Reason": exit_reason,
+        "Entry Order": pos.get("entry_order_id", "—"),
+        "Exit Order":  order_id or "—",
     })
 
-    if trade_pnl <= 0:
+    if net_pnl <= 0:
         st.session_state.loss_streak += 1
         if st.session_state.loss_streak >= MAX_LOSS_STREAK:
             st.session_state.bot_active = False
-            st.error(
-                f"🚨 Circuit breaker: {MAX_LOSS_STREAK} consecutive losses. "
-                "Bot halted. Review and restart manually."
-            )
+            st.error(f"🚨 Circuit breaker: {MAX_LOSS_STREAK} consecutive losses. Bot halted.")
     else:
         st.session_state.loss_streak = 0
-
     st.session_state.current_position = None
 
 
 # ==============================================================================
-# STREAMLIT SESSION STATE BOOTSTRAP
+# GUARDRAIL + INDICATOR HELPERS
+# ==============================================================================
+
+def check_daily_guardrails(session_pnl: float, trade_count: int,
+                            max_daily_loss: float, max_trades: int) -> tuple[bool, str]:
+    if session_pnl <= -abs(max_daily_loss):
+        return False, f"🚨 Daily loss limit ₹{abs(max_daily_loss):,.0f} hit. Bot halted."
+    if trade_count >= max_trades:
+        return False, f"📊 Max {max_trades} trades/day reached. Bot paused."
+    if not in_prime_session():
+        return False, f"🕐 Outside prime window. Next: {next_window_str()}"
+    return True, ""
+
+
+def get_htf_trend(token: str) -> int:
+    """Returns +1 (bull), -1 (bear), 0 (neutral/insufficient data) on 5-min."""
+    df5 = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval="5minute")
+    if df5.empty or len(df5) < 22:
+        return 0
+    df5["EMA_9"]  = ta.trend.ema_indicator(df5["close"], window=9)
+    df5["EMA_21"] = ta.trend.ema_indicator(df5["close"], window=21)
+    last5 = df5.iloc[-1]
+    if last5["EMA_9"] > last5["EMA_21"]:
+        return 1
+    if last5["EMA_9"] < last5["EMA_21"]:
+        return -1
+    return 0
+
+
+def compute_atr_sl_target(df: pd.DataFrame, entry_ltp: float,
+                           atr_multiplier: float, rr_min: float,
+                           delta: float = 0.5) -> tuple[float, float] | None:
+    atr     = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
+    atr_val = float(atr.dropna().iloc[-1]) if not atr.dropna().empty else 0
+    if atr_val <= 0:
+        return None
+    sl_distance  = atr_val * atr_multiplier * delta
+    tgt_distance = sl_distance * rr_min
+    sl_price     = entry_ltp - sl_distance
+    target_price = entry_ltp + tgt_distance
+    if sl_price <= 0 or sl_price >= entry_ltp:
+        return None
+    return round(sl_price, 2), round(target_price, 2)
+
+
+def compute_supertrend(df: pd.DataFrame, length: int = 7,
+                        multiplier: float = 3.0) -> pd.Series:
+    hl_avg    = (df["high"] + df["low"]) / 2
+    atr       = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=length)
+    upper     = hl_avg + multiplier * atr
+    lower     = hl_avg - multiplier * atr
+    direction = pd.Series(1, index=df.index)
+    for i in range(1, len(df)):
+        if df["close"].iloc[i] > upper.iloc[i - 1]:
+            direction.iloc[i] = 1
+        elif df["close"].iloc[i] < lower.iloc[i - 1]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i - 1]
+    return direction
+
+
+# ==============================================================================
+# ── FIX: SIGNAL STATE MACHINE ────────────────────────────────────────────────
+# The old code required ALL 7 conditions to be True on the SAME 2-second cycle.
+# EMA crossover fires for ONE bar only — probability of it coinciding with
+# every other condition simultaneously is near zero.
+#
+# New approach: two-stage signal pipeline
+#   Stage 1 — SETUP: EMA crossover + trend/volume/supertrend detected.
+#              Stored in session_state with a bar counter.
+#   Stage 2 — CONFIRM: RSI, VWAP, OI, HTF checked on SUBSEQUENT bars.
+#              Entry fires when all Stage 2 conditions hold for SIGNAL_HOLD_BARS.
+# ==============================================================================
+
+def evaluate_signal(df: pd.DataFrame, vwap_value: float, oi: dict,
+                    htf_trend: int) -> str:
+    """
+    Returns 'call', 'put', or 'none'.
+    Uses a two-stage pipeline stored in session_state.
+    """
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # ── Stage 1: Setup conditions (structural) ────────────────────────────────
+    ema_bull     = prev["EMA_9"] <= prev["EMA_21"] and last["EMA_9"] > last["EMA_21"]
+    ema_bear     = prev["EMA_9"] >= prev["EMA_21"] and last["EMA_9"] < last["EMA_21"]
+    is_trending  = float(last["ADX"]) > 25
+    is_high_vol  = float(last["volume"]) > float(last["Vol_SMA"])
+    st_bull      = int(last["ST_Direction"]) == 1
+    st_bear      = int(last["ST_Direction"]) == -1
+
+    # Latch: if a fresh crossover occurs, reset the pending signal
+    if ema_bull and is_trending and st_bull:
+        st.session_state.pending_signal     = "call"
+        st.session_state.pending_signal_bars = 0
+    elif ema_bear and is_trending and st_bear:
+        st.session_state.pending_signal     = "put"
+        st.session_state.pending_signal_bars = 0
+
+    pending = st.session_state.get("pending_signal", "none")
+    if pending == "none":
+        return "none"
+
+    # ── Stage 2: Confirmation conditions (momentum + context) ─────────────────
+    last_close = float(last["close"])
+    rsi_now    = float(last["RSI_14"])
+    rsi_prev   = float(prev["RSI_14"])
+
+    # ── FIX: OI gate is relaxed when OI API is unavailable ───────────────────
+    oi_up = oi.get("oi_available", False)
+    if oi_up:
+        oi_confirms_call = oi["oi_surge_ce"] or (oi["pcr"] > 1.0)
+        oi_confirms_put  = oi["oi_surge_pe"] or (oi["pcr"] < 1.0)
+    else:
+        # OI API down — skip OI filter entirely, don't block the trade
+        oi_confirms_call = True
+        oi_confirms_put  = True
+
+    htf_allows_call = htf_trend >= 0
+    htf_allows_put  = htf_trend <= 0
+
+    if pending == "call":
+        confirmed = (
+            is_high_vol
+            and last_close > vwap_value
+            and rsi_now > rsi_prev and 45 < rsi_now < 75
+            and oi_confirms_call
+            and htf_allows_call
+        )
+    elif pending == "put":
+        confirmed = (
+            is_high_vol
+            and last_close < vwap_value
+            and rsi_now < rsi_prev and 25 < rsi_now < 55
+            and oi_confirms_put
+            and htf_allows_put
+        )
+    else:
+        confirmed = False
+
+    if confirmed:
+        st.session_state.pending_signal_bars = \
+            st.session_state.get("pending_signal_bars", 0) + 1
+    else:
+        # Confirmation failed — reset pending
+        st.session_state.pending_signal      = "none"
+        st.session_state.pending_signal_bars = 0
+        return "none"
+
+    if st.session_state.pending_signal_bars >= SIGNAL_HOLD_BARS:
+        fired  = pending
+        st.session_state.pending_signal      = "none"
+        st.session_state.pending_signal_bars = 0
+        return fired
+
+    return "none"
+
+
+# ==============================================================================
+# SESSION STATE BOOTSTRAP
 # ==============================================================================
 st.set_page_config(page_title="Upstox Algo Scalper", layout="wide")
 
 defaults = {
-    "bot_active":       False,
-    "current_position": None,
-    "trade_logs":       [],
-    "session_pnl":      0.0,
-    "loss_streak":      0,
-    "oi_snapshot":      {},
-    "oi_history":       [],
-    "order_log":        [],
-    "api_last_call":    {},
+    "bot_active":          False,
+    "current_position":    None,
+    "trade_logs":          [],
+    "session_pnl":         0.0,
+    "loss_streak":         0,
+    "oi_snapshot":         {},
+    "oi_history":          [],
+    "order_log":           [],
+    "api_last_call":       {},
+    "api_errors":          [],
+    "pending_signal":      "none",
+    "pending_signal_bars": 0,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -439,10 +616,21 @@ ACCESS_TOKEN = st.sidebar.text_input(
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Strategy Parameters")
 INITIAL_CAPITAL = st.sidebar.number_input("Starting Capital (₹)", value=50_000, step=5_000)
-STOP_LOSS_PCT   = st.sidebar.slider("Stop Loss (%)",     1, 10, 6)  / 100.0
-TARGET_PCT      = st.sidebar.slider("Target Profit (%)", 1, 25, 12) / 100.0
+STOP_LOSS_PCT   = st.sidebar.slider("Stop Loss % (ATR fallback)", 1, 10, DEFAULT_STOP_LOSS_PCT) / 100.0
+TARGET_PCT      = st.sidebar.slider("Target % (ATR fallback)",   1, 25, DEFAULT_TARGET_PCT)    / 100.0
+ATR_MULTIPLIER  = st.sidebar.slider("ATR SL Multiplier", 1.0, 3.0, 1.5, step=0.1)
+RR_MIN          = st.sidebar.slider("Min Risk:Reward",   1.0, 4.0, float(DEFAULT_RR_MIN), step=0.1)
 LOT_SIZE        = st.sidebar.number_input("Lot Size", value=NIFTY_LOT_SIZE, min_value=1, step=1)
-TRADE_MODE      = st.sidebar.radio(
+
+st.sidebar.markdown("---")
+st.sidebar.header("🛡️ Risk Guardrails")
+MAX_DAILY_LOSS = st.sidebar.number_input("Daily Loss Limit (₹)", value=DEFAULT_MAX_DAILY_LOSS,
+                                          step=500, min_value=500)
+MAX_TRADES     = st.sidebar.number_input("Max Trades / Day",      value=DEFAULT_MAX_TRADES,
+                                          step=1,   min_value=1)
+
+st.sidebar.markdown("---")
+TRADE_MODE = st.sidebar.radio(
     "🎯 Execution Mode",
     ["📄 Paper Trading (Simulated)", "⚡ Live Trading (Real Money)"],
 )
@@ -450,7 +638,9 @@ IS_PAPER = "Paper" in TRADE_MODE
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"⚡ Circuit breaker after **{MAX_LOSS_STREAK}** consecutive losses")
-st.sidebar.caption(f"📊 OI surge threshold: **{OI_SURGE_RATIO}×** 5-bar average")
+st.sidebar.caption(f"📊 OI surge threshold: **{OI_SURGE_RATIO}×** 5-bar avg")
+st.sidebar.caption(f"💸 Slippage: ₹{SLIPPAGE_PER_SIDE}/unit/side")
+st.sidebar.caption(f"🕐 Server IST: **{ist_time_str()}**")
 
 current_capital = INITIAL_CAPITAL + st.session_state.session_pnl
 
@@ -464,22 +654,38 @@ if ACCESS_TOKEN and "instrument_master" not in st.session_state:
 # ==============================================================================
 st.title("🦅 Upstox Options Advanced Scalping Engine")
 
-m1, m2, m3, m4, m5 = st.columns(5)
-nifty_spot = fetch_ltp(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") if ACCESS_TOKEN else None
+# ── Row 1: KPI Metrics ────────────────────────────────────────────────────────
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+nifty_spot  = fetch_ltp(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") if ACCESS_TOKEN else None
+trade_count = len(st.session_state.trade_logs)
 
-m1.metric("📊 Nifty 50 Spot",   f"₹{nifty_spot:,.2f}" if nifty_spot else "—")
-m2.metric("💰 Account Balance", f"₹{current_capital:,.2f}")
-m3.metric(
-    "📈 Session PnL",
-    f"₹{st.session_state.session_pnl:,.2f}",
-    delta=f"{(st.session_state.session_pnl / INITIAL_CAPITAL * 100):.2f}%" if INITIAL_CAPITAL else "0%",
-)
-m4.metric("🛡️ Mode",       "LIVE" if not IS_PAPER else "PAPER")
-m5.metric("🔴 Loss Streak", f"{st.session_state.loss_streak} / {MAX_LOSS_STREAK}",
+m1.metric("📊 Nifty Spot",    f"₹{nifty_spot:,.2f}" if nifty_spot else "—")
+m2.metric("💰 Balance",       f"₹{current_capital:,.2f}")
+m3.metric("📈 Session PnL",   f"₹{st.session_state.session_pnl:,.2f}",
+          delta=f"{(st.session_state.session_pnl/INITIAL_CAPITAL*100):.2f}%" if INITIAL_CAPITAL else "0%")
+m4.metric("🛡️ Mode",          "LIVE" if not IS_PAPER else "PAPER")
+m5.metric("🔴 Loss Streak",   f"{st.session_state.loss_streak} / {MAX_LOSS_STREAK}",
           delta="⚠️ At limit!" if st.session_state.loss_streak >= MAX_LOSS_STREAK - 1 else None)
+m6.metric("📋 Trades Today",  f"{trade_count} / {MAX_TRADES}",
+          delta="⚠️ Near limit!" if trade_count >= MAX_TRADES - 1 else None)
+
+# ── Session window banner ──────────────────────────────────────────────────────
+if in_prime_session():
+    st.success(f"🟢 **Prime Session Active** ({ist_time_str()}) — scanning for entries")
+else:
+    st.warning(f"🕐 **Outside Prime Window** ({ist_time_str()}) — next: {next_window_str()}")
+
+# ── Pending signal state indicator ────────────────────────────────────────────
+pending = st.session_state.get("pending_signal", "none")
+if pending != "none":
+    bars = st.session_state.get("pending_signal_bars", 0)
+    direction_label = "📈 CALL" if pending == "call" else "📉 PUT"
+    st.info(f"⏳ **Stage 1 setup latched: {direction_label}** — confirming… "
+            f"({bars}/{SIGNAL_HOLD_BARS} bars)")
 
 st.markdown("---")
 
+# ── Row 2: Controls | OI | Position ──────────────────────────────────────────
 col_ctrl, col_oi, col_pos = st.columns([1, 1, 2])
 
 with col_ctrl:
@@ -489,8 +695,10 @@ with col_ctrl:
     else:
         if not st.session_state.bot_active:
             if st.button("▶️ START BOT", type="primary", use_container_width=True):
-                st.session_state.bot_active  = True
-                st.session_state.loss_streak = 0
+                st.session_state.bot_active          = True
+                st.session_state.loss_streak         = 0
+                st.session_state.pending_signal      = "none"
+                st.session_state.pending_signal_bars = 0
                 st.rerun()
         else:
             if st.button("🛑 EMERGENCY HALT", type="secondary", use_container_width=True):
@@ -502,7 +710,7 @@ with col_ctrl:
                 st.session_state.current_position = None
                 st.rerun()
 
-        status = "🟢 Active & Scanning" if st.session_state.bot_active else "🔴 Inactive"
+        status = "🟢 Active" if st.session_state.bot_active else "🔴 Inactive"
         st.info(f"State: **{status}**")
 
         if st.session_state.trade_logs:
@@ -513,40 +721,48 @@ with col_ctrl:
 
 with col_oi:
     st.subheader("📊 OI Intelligence")
+    # ── FIX: fetch OI eagerly for display even before first loop cycle ─────────
+    if ACCESS_TOKEN and not st.session_state.get("oi_snapshot") and nifty_spot:
+        _spot = nifty_spot or 24000.0
+        fetch_option_chain_oi(ACCESS_TOKEN, _spot)
+
     snap = st.session_state.get("oi_snapshot", {})
     if snap:
-        ce_oi = snap.get("ce_oi", 0)
-        pe_oi = snap.get("pe_oi", 0)
-        pcr   = pe_oi / ce_oi if ce_oi > 0 else 1.0
-        o1, o2 = st.columns(2)
+        ce_oi    = snap.get("ce_oi", 0)
+        pe_oi    = snap.get("pe_oi", 0)
+        pcr      = pe_oi / ce_oi if ce_oi > 0 else 1.0
+        o1, o2   = st.columns(2)
         o1.metric("CE OI", f"{ce_oi/1e5:.2f}L")
         o2.metric("PE OI", f"{pe_oi/1e5:.2f}L")
         pcr_icon = "🟢" if pcr > 1.2 else "🔴" if pcr < 0.8 else "🟡"
-        st.metric("PCR", f"{pcr_icon} {pcr:.2f}",
-                  help="PCR > 1.2 = bullish, < 0.8 = bearish")
+        st.metric("PCR", f"{pcr_icon} {pcr:.2f}", help="PCR > 1.2 = bullish, < 0.8 = bearish")
         hist = st.session_state.get("oi_history", [])
         if len(hist) > 1:
             st.line_chart(pd.DataFrame(hist).tail(15)[["ce_oi", "pe_oi"]],
                           height=120, use_container_width=True)
     else:
-        st.info("OI data loads when the bot is active.")
+        st.info("OI loading… (requires valid token + market hours)")
 
 with col_pos:
     st.subheader("📦 Active Position")
     pos = st.session_state.current_position
     if pos and ACCESS_TOKEN:
         pos_ltp = fetch_ltp(ACCESS_TOKEN, pos["key"]) or pos["entry_price"]
-        unr_pnl = (pos_ltp - pos["entry_price"]) * LOT_SIZE
+        unr_pnl = (pos_ltp - pos["entry_price"]) * LOT_SIZE - SLIPPAGE_PER_SIDE * 2 * LOT_SIZE
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Symbol", pos["symbol"])
         c2.metric("Entry",  f"₹{pos['entry_price']:.2f}")
         c3.metric("LTP",    f"₹{pos_ltp:.2f}")
-        c4.metric("Unrealized PnL", f"₹{unr_pnl:.2f}",
+        c4.metric("Est. Net PnL", f"₹{unr_pnl:.2f}",
                   delta=f"{((pos_ltp-pos['entry_price'])/pos['entry_price']*100):.1f}%")
+        risk_pts = abs(pos["entry_price"] - pos["sl_price"])
+        rwd_pts  = abs(pos["target_price"] - pos["entry_price"])
+        rr_setup = round(rwd_pts / risk_pts, 2) if risk_pts > 0 else 0
         st.caption(
             f"🎯 Target: **₹{pos['target_price']:.2f}** | "
             f"🛡️ Trailing SL: **₹{pos['sl_price']:.2f}** | "
             f"📈 Peak: **₹{pos['highest_price']:.2f}** | "
+            f"⚖️ RR: **{rr_setup}** | "
             f"🆔 Order: `{pos.get('entry_order_id','—')}`"
         )
     else:
@@ -557,6 +773,18 @@ with col_pos:
 # ==============================================================================
 if st.session_state.bot_active and ACCESS_TOKEN:
 
+    # ── Daily guardrail checks ────────────────────────────────────────────────
+    allowed, reason = check_daily_guardrails(
+        st.session_state.session_pnl, trade_count, MAX_DAILY_LOSS, MAX_TRADES
+    )
+    if not allowed:
+        if "limit" in reason.lower() or "max" in reason.lower():
+            st.session_state.bot_active = False
+        st.warning(reason)
+        time.sleep(30)
+        st.rerun()
+
+    # ── 1-min candle data ─────────────────────────────────────────────────────
     df = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
     if df.empty or len(df) < 30:
         st.warning("⏳ Waiting for ≥ 30 candles…")
@@ -564,129 +792,100 @@ if st.session_state.bot_active and ACCESS_TOKEN:
         st.rerun()
 
     # ── Indicators ────────────────────────────────────────────────────────────
-    df["EMA_9"]   = ta.trend.ema_indicator(df["close"], window=9)
-    df["EMA_21"]  = ta.trend.ema_indicator(df["close"], window=21)
-    df["Vol_SMA"] = df["volume"].rolling(window=20).mean()
-    df["RSI_14"]  = ta.momentum.rsi(df["close"], window=14)
-    df["ADX"]     = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
-
-    def compute_supertrend(df: pd.DataFrame, length: int = 7, multiplier: float = 3.0) -> pd.Series:
-        hl_avg = (df["high"] + df["low"]) / 2
-        atr    = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=length)
-        upper  = hl_avg + multiplier * atr
-        lower  = hl_avg - multiplier * atr
-        direction = pd.Series(1, index=df.index)
-        for i in range(1, len(df)):
-            if df["close"].iloc[i] > upper.iloc[i - 1]:
-                direction.iloc[i] = 1
-            elif df["close"].iloc[i] < lower.iloc[i - 1]:
-                direction.iloc[i] = -1
-            else:
-                direction.iloc[i] = direction.iloc[i - 1]
-        return direction
-
+    df["EMA_9"]        = ta.trend.ema_indicator(df["close"], window=9)
+    df["EMA_21"]       = ta.trend.ema_indicator(df["close"], window=21)
+    df["Vol_SMA"]      = df["volume"].rolling(window=20).mean()
+    df["RSI_14"]       = ta.momentum.rsi(df["close"], window=14)
+    df["ADX"]          = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
     df["ST_Direction"] = compute_supertrend(df)
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    last       = df.iloc[-1]
+    prev       = df.iloc[-2]
+    last_close = float(last["close"])
 
-    # ── VWAP — resolved as a plain float, never assigned to df ───────────────
-    # This avoids KeyError on last["VWAP"] entirely.
+    # ── VWAP scalar ───────────────────────────────────────────────────────────
     live_vwap = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
-
     if live_vwap and live_vwap > 0:
         vwap_value = live_vwap
     else:
-        # Calculated fallback — extract scalar, do not write to df
         tp          = (df["high"] + df["low"] + df["close"]) / 3
-        cum_tpv     = (tp * df["volume"]).cumsum()
-        cum_vol     = df["volume"].cumsum().replace(0, float("nan"))
-        vwap_series = cum_tpv / cum_vol
+        vwap_series = (tp * df["volume"]).cumsum() / df["volume"].cumsum().replace(0, float("nan"))
         valid       = vwap_series.dropna()
-        vwap_value  = float(valid.iloc[-1]) if not valid.empty else float(last["close"])
+        vwap_value  = float(valid.iloc[-1]) if not valid.empty else last_close
 
-    last_close = float(last["close"])
+    # ── OI + HTF ──────────────────────────────────────────────────────────────
+    spot_ref  = nifty_spot or last_close
+    oi        = fetch_option_chain_oi(ACCESS_TOKEN, spot_ref)
+    htf_trend = get_htf_trend(ACCESS_TOKEN)
+    master    = load_instrument_master()
 
-    # ── OI snapshot ───────────────────────────────────────────────────────────
-    spot_ref = nifty_spot or last_close
-    oi       = fetch_option_chain_oi(ACCESS_TOKEN, spot_ref)
-    master   = load_instrument_master()
-
-    # ── Signal Detection ──────────────────────────────────────────────────────
+    # ── Signal state machine ──────────────────────────────────────────────────
     if st.session_state.current_position is None:
-        ema_bull = (prev["EMA_9"] <= prev["EMA_21"]) and (last["EMA_9"] > last["EMA_21"])
-        ema_bear = (prev["EMA_9"] >= prev["EMA_21"]) and (last["EMA_9"] < last["EMA_21"])
+        signal = evaluate_signal(df, vwap_value, oi, htf_trend)
 
-        is_trending      = last["ADX"]    > 25
-        is_high_vol      = last["volume"] > last["Vol_SMA"]
-
-        # ✅ Use vwap_value (plain float) — not last["VWAP"]
-        above_vwap       = last_close > vwap_value
-        below_vwap       = last_close < vwap_value
-
-        oi_confirms_call = oi["oi_surge_ce"] or (oi["pcr"] > 1.0)
-        oi_confirms_put  = oi["oi_surge_pe"] or (oi["pcr"] < 1.0)
-
-        call_signal = (
-            ema_bull and is_trending and is_high_vol
-            and last["ST_Direction"] == 1
-            and last["RSI_14"] > 50
-            and above_vwap
-            and oi_confirms_call
-        )
-        put_signal = (
-            ema_bear and is_trending and is_high_vol
-            and last["ST_Direction"] == -1
-            and last["RSI_14"] < 50
-            and below_vwap
-            and oi_confirms_put
-        )
-
-        if call_signal or put_signal:
-            ot            = "CE" if call_signal else "PE"
+        if signal in ("call", "put"):
+            ot            = "CE" if signal == "call" else "PE"
             ikey, isymbol = resolve_atm_option_key(ACCESS_TOKEN, spot_ref, ot, master)
             entry_ltp     = fetch_ltp(ACCESS_TOKEN, ikey)
 
             if entry_ltp is None or entry_ltp <= 0:
-                st.warning(f"⚠️ No valid LTP for {isymbol} — skipping entry.")
+                st.warning(f"⚠️ No valid LTP for {isymbol} — skipping.")
             else:
-                order_id = place_order(ACCESS_TOKEN, ikey, "BUY", LOT_SIZE,
-                                       order_type="MARKET", paper_mode=IS_PAPER)
-                if order_id is None and not IS_PAPER:
-                    st.error("🚨 BUY order failed — entry aborted.")
+                atr_levels = compute_atr_sl_target(df, entry_ltp, ATR_MULTIPLIER, RR_MIN)
+                if atr_levels:
+                    sl_price, target_price = atr_levels
                 else:
-                    st.session_state.current_position = {
-                        "key":            ikey,
-                        "symbol":         isymbol,
-                        "entry_price":    entry_ltp,
-                        "highest_price":  entry_ltp,
-                        "sl_price":       entry_ltp * (1 - STOP_LOSS_PCT),
-                        "target_price":   entry_ltp * (1 + TARGET_PCT),
-                        "entry_time":     datetime.now().strftime("%H:%M:%S"),
-                        "direction":      ot,
-                        "entry_order_id": order_id,
-                    }
-                    lbl = "📈 CALL" if ot == "CE" else "📉 PUT"
-                    st.success(f"🚨 {lbl} — {isymbol} @ ₹{entry_ltp:.2f} | Order: {order_id}")
-                    st.rerun()
+                    sl_price     = entry_ltp * (1 - STOP_LOSS_PCT)
+                    target_price = entry_ltp * (1 + TARGET_PCT)
 
-    # ── Position Management ───────────────────────────────────────────────────
+                risk_pts = entry_ltp - sl_price
+                rwd_pts  = target_price - entry_ltp
+                rr_setup = rwd_pts / risk_pts if risk_pts > 0 else 0
+
+                if rr_setup < RR_MIN:
+                    st.warning(f"⚖️ RR {rr_setup:.2f} < min {RR_MIN} — skipping {isymbol}.")
+                else:
+                    order_id = place_order(ACCESS_TOKEN, ikey, "BUY", LOT_SIZE,
+                                           order_type="MARKET", paper_mode=IS_PAPER)
+                    if order_id is None and not IS_PAPER:
+                        st.error("🚨 BUY order failed — entry aborted.")
+                    else:
+                        st.session_state.current_position = {
+                            "key":            ikey,
+                            "symbol":         isymbol,
+                            "entry_price":    entry_ltp,
+                            "highest_price":  entry_ltp,
+                            "sl_price":       sl_price,
+                            "target_price":   target_price,
+                            "entry_time":     now_ist().strftime("%H:%M:%S"),
+                            "direction":      ot,
+                            "entry_order_id": order_id,
+                            "rr_setup":       round(rr_setup, 2),
+                        }
+                        lbl = "📈 CALL" if ot == "CE" else "📉 PUT"
+                        st.success(
+                            f"🚨 {lbl} — {isymbol} @ ₹{entry_ltp:.2f} | "
+                            f"SL ₹{sl_price:.2f} | Tgt ₹{target_price:.2f} | "
+                            f"RR {rr_setup:.2f} | Order: {order_id}"
+                        )
+                        st.rerun()
+
+    # ── Position management ───────────────────────────────────────────────────
     else:
         pos     = st.session_state.current_position
         pos_ltp = fetch_ltp(ACCESS_TOKEN, pos["key"])
-
         if pos_ltp is None:
             st.warning("⚠️ LTP fetch failed — retrying next cycle.")
         else:
             if pos_ltp > pos["highest_price"]:
                 st.session_state.current_position["highest_price"] = pos_ltp
-                new_sl = pos_ltp * (1 - STOP_LOSS_PCT)
+                atr_levels = compute_atr_sl_target(df, pos_ltp, ATR_MULTIPLIER, RR_MIN)
+                new_sl     = atr_levels[0] if atr_levels else pos_ltp * (1 - STOP_LOSS_PCT)
                 if new_sl > pos["sl_price"]:
                     st.session_state.current_position["sl_price"] = new_sl
 
             hit_sl     = pos_ltp <= st.session_state.current_position["sl_price"]
             hit_target = pos_ltp >= pos["target_price"]
-
             if hit_sl or hit_target:
                 reason = "TARGET HIT ✅" if hit_target else "STOP LOSS ❌"
                 exit_position(ACCESS_TOKEN, pos, pos_ltp, reason, IS_PAPER, LOT_SIZE)
@@ -696,7 +895,7 @@ if st.session_state.bot_active and ACCESS_TOKEN:
     st.rerun()
 
 # ==============================================================================
-# TRADE LOG + SESSION STATS
+# TRADE LOG + STATS
 # ==============================================================================
 st.markdown("---")
 st.subheader("📑 Session Trade Log")
@@ -708,23 +907,42 @@ if st.session_state.trade_logs:
         color = "#22c55e" if val > 0 else "#ef4444" if val < 0 else "#94a3b8"
         return f"color: {color}; font-weight: bold"
 
-    st.dataframe(df_logs.style.applymap(style_pnl, subset=["PnL ₹"]),
+    st.dataframe(df_logs.style.applymap(style_pnl, subset=["Net PnL ₹"]),
                  use_container_width=True)
 
-    total = len(df_logs)
-    wins  = (df_logs["PnL ₹"] > 0).sum()
-    wr    = wins / total * 100 if total else 0
-    avg_w = df_logs[df_logs["PnL ₹"] > 0]["PnL ₹"].mean() if wins else 0
-    avg_l = df_logs[df_logs["PnL ₹"] <= 0]["PnL ₹"].mean() if (total - wins) else 0
+    total      = len(df_logs)
+    wins       = (df_logs["Net PnL ₹"] > 0).sum()
+    losses     = total - wins
+    wr         = wins / total * 100 if total else 0
+    avg_w      = df_logs[df_logs["Net PnL ₹"] > 0]["Net PnL ₹"].mean() if wins   else 0
+    avg_l      = df_logs[df_logs["Net PnL ₹"] <= 0]["Net PnL ₹"].mean() if losses else 0
+    rr_avg     = df_logs["RR Realised"].mean() if "RR Realised" in df_logs.columns else 0
+    ev         = (wr / 100 * avg_w) + ((1 - wr / 100) * avg_l)
+    total_slip = df_logs["Slippage ₹"].sum() if "Slippage ₹" in df_logs.columns else 0
 
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Total Trades", total)
-    s2.metric("Win Rate",     f"{wr:.1f}%")
-    s3.metric("Avg Win",      f"₹{avg_w:.2f}")
-    s4.metric("Avg Loss",     f"₹{avg_l:.2f}")
+    s1, s2, s3, s4, s5, s6, s7 = st.columns(7)
+    s1.metric("Trades",         total)
+    s2.metric("Win Rate",       f"{wr:.1f}%")
+    s3.metric("Avg Win",        f"₹{avg_w:.0f}")
+    s4.metric("Avg Loss",       f"₹{avg_l:.0f}")
+    s5.metric("Avg RR",         f"{rr_avg:.2f}",
+              delta="✅ On target" if rr_avg >= RR_MIN else "⚠️ Below target")
+    s6.metric("Expected Value", f"₹{ev:.0f}/trade",
+              delta="✅ Positive" if ev > 0 else "🔴 Negative edge")
+    s7.metric("Total Slippage", f"₹{total_slip:.0f}")
+
+    with st.expander("📈 Equity Curve"):
+        df_logs["Cumulative PnL"] = df_logs["Net PnL ₹"].cumsum()
+        st.line_chart(df_logs["Cumulative PnL"], use_container_width=True)
 else:
     st.info("No trades executed this session.")
 
+# ── Order log + API error log ─────────────────────────────────────────────────
 if st.session_state.order_log:
     with st.expander("🗂️ Raw Order Log"):
         st.dataframe(pd.DataFrame(st.session_state.order_log), use_container_width=True)
+
+if st.session_state.get("api_errors"):
+    with st.expander(f"⚠️ API Error Log ({len(st.session_state.api_errors)} errors)"):
+        st.dataframe(pd.DataFrame(st.session_state.api_errors), use_container_width=True)
+
