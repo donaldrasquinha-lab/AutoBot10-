@@ -13,11 +13,11 @@ UPSTOX_BASE_URL       = "https://api.upstox.com/v2"
 NIFTY_LOT_SIZE        = 65
 MAX_LOSS_STREAK       = 2
 OI_SURGE_RATIO        = 1.5
-SLIPPAGE_PER_SIDE     = 1.5      # ₹ per unit per side
+SLIPPAGE_PER_SIDE     = 1.5          # ₹ per unit per side
 IST                   = timezone(timedelta(hours=5, minutes=30))
 INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
-# ── Risk guardrails defaults ──────────────────────────────────────────────────
+# ── Risk guardrail defaults ───────────────────────────────────────────────────
 DEFAULT_MAX_DAILY_LOSS = 5000
 DEFAULT_MAX_TRADES     = 5
 DEFAULT_STOP_LOSS_PCT  = 6
@@ -30,8 +30,8 @@ PRIME_WINDOWS = [
     ("13:30", "14:45"),
 ]
 
-# ── Signal persistence: bars a condition must hold before entry ───────────────
-SIGNAL_HOLD_BARS = 2   # EMA crossover must sustain for this many consecutive bars
+# ── Signal state machine: bars confirmation must hold before entry ────────────
+SIGNAL_HOLD_BARS = 2
 
 # ==============================================================================
 # RATE-LIMIT AWARE HTTP CLIENT
@@ -44,20 +44,40 @@ if "api_last_call" not in st.session_state:
     st.session_state.api_last_call = {}
 
 
-def api_get(token: str, url: str, params: dict | None = None, timeout: int = 8) -> dict | None:
-    """Rate-limit-aware GET with exponential backoff on 429/5xx."""
-    path  = url.split("api.upstox.com")[-1]
+# ==============================================================================
+# ── KEY FIX: RAW URL BUILDER ─────────────────────────────────────────────────
+# requests.get(params=...) URL-encodes query strings, turning
+# "NSE_INDEX|Nifty 50" → "NSE_INDEX%7CNifty%2050".
+# Upstox validates the raw string server-side and rejects the encoded form
+# with error UDAPI100011 "Invalid Instrument".
+# _build_url() builds the query string manually so | and spaces are sent raw.
+# ==============================================================================
+
+def _build_url(base: str, params: dict) -> str:
+    """Builds URL with raw (un-encoded) query params — required by Upstox."""
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    return f"{base}?{qs}"
+
+
+def _auth_headers(token: str) -> dict:
+    return {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+
+
+def _raw_get(token: str, url: str, timeout: int = 8) -> dict | None:
+    """
+    GET using a pre-built raw URL (no params= encoding).
+    Handles 429 / 5xx with exponential backoff, logs 4xx errors.
+    """
+    path  = url.split("?")[0].split("api.upstox.com")[-1]
     gap   = time.time() - st.session_state.api_last_call.get(path, 0)
     if gap < MIN_GAP_S:
         time.sleep(MIN_GAP_S - gap)
 
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-    delay   = BASE_BACKOFF_S
-
+    delay = BASE_BACKOFF_S
     for attempt in range(MAX_RETRIES):
         try:
             st.session_state.api_last_call[path] = time.time()
-            res = requests.get(url, headers=headers, params=params, timeout=timeout)
+            res = requests.get(url, headers=_auth_headers(token), timeout=timeout)
             if res.status_code == 200:
                 return res.json()
             if res.status_code == 429:
@@ -68,11 +88,12 @@ def api_get(token: str, url: str, params: dict | None = None, timeout: int = 8) 
                 time.sleep(delay)
                 delay *= 2
                 continue
-            # Log non-retriable errors to session state for the debug panel
+            # 4xx — log and return None
             st.session_state.setdefault("api_errors", []).append({
                 "time": now_ist().strftime("%H:%M:%S"),
-                "url": url, "status": res.status_code,
-                "body": res.text[:200],
+                "endpoint": path,
+                "status": res.status_code,
+                "body": res.text[:300],
             })
             return None
         except requests.exceptions.Timeout:
@@ -81,24 +102,35 @@ def api_get(token: str, url: str, params: dict | None = None, timeout: int = 8) 
         except Exception as e:
             st.session_state.setdefault("api_errors", []).append({
                 "time": now_ist().strftime("%H:%M:%S"),
-                "url": url, "status": "exception", "body": str(e),
+                "endpoint": path,
+                "status": "exception",
+                "body": str(e),
             })
             return None
     return None
 
 
+def api_get(token: str, url: str, params: dict | None = None, timeout: int = 8) -> dict | None:
+    """
+    Wrapper for endpoints that do NOT contain special chars in params.
+    For instrument_key params use _raw_get(_build_url(...)) instead.
+    """
+    if params:
+        built = _build_url(url, params)
+        return _raw_get(token, built, timeout)
+    return _raw_get(token, url, timeout)
+
+
 # ==============================================================================
 # IST TIME HELPERS
-# ── FIX: Streamlit Cloud runs UTC. All time comparisons use IST explicitly.
+# ── Streamlit Cloud runs UTC. All time comparisons use explicit IST offset.
 # ==============================================================================
 
 def now_ist() -> datetime:
-    """Current datetime in IST regardless of server timezone."""
     return datetime.now(tz=IST)
 
 
 def in_prime_session() -> bool:
-    """True if current IST time is inside a prime trading window."""
     now = now_ist().time()
     for start_str, end_str in PRIME_WINDOWS:
         start = datetime.strptime(start_str, "%H:%M").time()
@@ -187,15 +219,18 @@ def resolve_atm_option_key(token: str, spot: float, option_type: str,
 
 # ==============================================================================
 # CORE API HELPERS
+# All instrument_key params are passed via _build_url to avoid encoding.
 # ==============================================================================
 
 def fetch_ltp(token: str, instrument_key: str) -> float | None:
-    data = api_get(token, f"{UPSTOX_BASE_URL}/market-quote/ltp",
-                   params={"instrument_key": instrument_key})
+    url  = _build_url(f"{UPSTOX_BASE_URL}/market-quote/ltp",
+                      {"instrument_key": instrument_key})
+    data = _raw_get(token, url)
     if data is None:
         return None
     try:
-        return float(data["data"][instrument_key.replace("|", ":")]["last_price"])
+        normalized = instrument_key.replace("|", ":")
+        return float(data["data"][normalized]["last_price"])
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -204,8 +239,9 @@ def fetch_ltp_batch(token: str, instrument_keys: list[str]) -> dict:
     results = {}
     for i in range(0, len(instrument_keys), 50):
         batch = instrument_keys[i : i + 50]
-        data  = api_get(token, f"{UPSTOX_BASE_URL}/market-quote/ltp",
-                        params={"instrument_key": ",".join(batch)})
+        url   = _build_url(f"{UPSTOX_BASE_URL}/market-quote/ltp",
+                           {"instrument_key": ",".join(batch)})
+        data  = _raw_get(token, url)
         if data is None:
             continue
         for raw_key, val in data.get("data", {}).items():
@@ -218,8 +254,10 @@ def fetch_ltp_batch(token: str, instrument_keys: list[str]) -> dict:
 
 def fetch_historical_candles(token: str, instrument_key: str,
                               interval: str = "1minute") -> pd.DataFrame:
-    url  = f"{UPSTOX_BASE_URL}/historical-candle/intraday/{instrument_key}/{interval}"
-    data = api_get(token, url)
+    # instrument_key embedded in path — encode spaces as %20 for path safety
+    safe_key = instrument_key.replace(" ", "%20")
+    url      = f"{UPSTOX_BASE_URL}/historical-candle/intraday/{safe_key}/{interval}"
+    data     = _raw_get(token, url)
     if data is None:
         return pd.DataFrame()
     try:
@@ -235,14 +273,17 @@ def fetch_historical_candles(token: str, instrument_key: str,
 
 
 def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
+    """Fetches session VWAP from /market-quote/ohlc using raw URL."""
     if not token:
         return None
-    data = api_get(token, f"{UPSTOX_BASE_URL}/market-quote/ohlc",
-                   params={"instrument_key": instrument_key, "interval": "1d"})
+    url  = _build_url(f"{UPSTOX_BASE_URL}/market-quote/ohlc",
+                      {"instrument_key": instrument_key, "interval": "1d"})
+    data = _raw_get(token, url)
     if not data:
         return None
     try:
-        vwap = data["data"][instrument_key.replace("|", ":")]["ohlc"].get("vwap")
+        normalized = instrument_key.replace("|", ":")
+        vwap = data["data"][normalized]["ohlc"].get("vwap")
         return float(vwap) if vwap else None
     except (KeyError, TypeError, ValueError):
         return None
@@ -250,19 +291,12 @@ def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
 
 # ==============================================================================
 # OPTION CHAIN OI
-# ── FIX 1: instrument_key for index uses correct Upstox format
-# ── FIX 2: OI fetch now runs once at startup (not only inside loop)
-#           so the OI panel always has data when bot is active
-# ── FIX 3: oi_confirms fallback is True (not False) when OI API is down,
-#           so OI fetch failure no longer silently blocks all entries
+# ── Uses _build_url so "NSE_INDEX|Nifty 50" is sent raw (not URL-encoded).
+# ── oi_available flag: when False, OI gate is bypassed in signal logic
+#    so a temporary OI outage does not silently block all entries.
 # ==============================================================================
 
 def fetch_option_chain_oi(token: str, spot: float) -> dict:
-    """
-    Fetches ATM OI from /v2/option/chain.
-    Returns neutral defaults with oi_confirms=True if the API fails,
-    so a temporary OI outage does not block all entries.
-    """
     atm_strike = round(spot / 50) * 50
     master     = st.session_state.get("instrument_master", pd.DataFrame())
     expiries   = get_weekly_expiries(master) if not master.empty else []
@@ -275,23 +309,17 @@ def fetch_option_chain_oi(token: str, spot: float) -> dict:
             days_to_thursday = 7
         expiry_str = (today + timedelta(days=days_to_thursday)).strftime("%Y-%m-%d")
 
-    # ── FIX: correct instrument_key for Nifty index ───────────────────────────
-    data = api_get(token, f"{UPSTOX_BASE_URL}/option/chain",
-                   params={"instrument_key": "NSE_INDEX|Nifty%2050",
-                            "expiry_date": expiry_str})
+    # ── Raw URL — pipe and space sent exactly as Upstox expects ──────────────
+    url  = _build_url(f"{UPSTOX_BASE_URL}/option/chain",
+                      {"instrument_key": "NSE_INDEX|Nifty 50",
+                       "expiry_date":    expiry_str})
+    data = _raw_get(token, url)
 
-    # Fallback: if URL-encoding didn't help, try plain string
-    if data is None:
-        data = api_get(token, f"{UPSTOX_BASE_URL}/option/chain",
-                       params={"instrument_key": "NSE_INDEX|Nifty 50",
-                                "expiry_date": expiry_str})
-
-    # ── FIX: neutral defaults with oi_confirms=True so OI failure ≠ no trade ──
     empty = {
         "atm_strike": atm_strike, "ce_oi": 0, "pe_oi": 0, "pcr": 1.0,
         "ce_oi_chg": 0, "pe_oi_chg": 0,
         "oi_surge_ce": False, "oi_surge_pe": False,
-        "oi_available": False,   # flag: False = API failed, use relaxed gate
+        "oi_available": False,
     }
     if data is None:
         return empty
@@ -314,7 +342,9 @@ def fetch_option_chain_oi(token: str, spot: float) -> dict:
         st.session_state.oi_history = history[-20:]
         return {
             "atm_strike":  float(atm_row.get("strike_price", atm_strike)),
-            "ce_oi": ce_oi, "pe_oi": pe_oi, "pcr": pcr,
+            "ce_oi":       ce_oi,
+            "pe_oi":       pe_oi,
+            "pcr":         pcr,
             "ce_oi_chg":   ce_oi - prev.get("ce_oi", ce_oi),
             "pe_oi_chg":   pe_oi - prev.get("pe_oi", pe_oi),
             "oi_surge_ce": ce_oi >= OI_SURGE_RATIO * avg_ce if avg_ce > 0 else False,
@@ -343,14 +373,23 @@ def place_order(token: str, instrument_key: str, transaction_type: str,
         return sim_id
 
     url     = f"{UPSTOX_BASE_URL}/order/place"
-    headers = {"Accept": "application/json", "Content-Type": "application/json",
-               "Authorization": f"Bearer {token}"}
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
     payload = {
-        "quantity": quantity, "product": "I", "validity": "DAY",
-        "price": price if order_type == "LIMIT" else 0,
-        "tag": "SCALPER", "instrument_token": instrument_key,
-        "order_type": order_type, "transaction_type": transaction_type,
-        "disclosed_quantity": 0, "trigger_price": 0, "is_amo": False,
+        "quantity":           quantity,
+        "product":            "I",
+        "validity":           "DAY",
+        "price":              price if order_type == "LIMIT" else 0,
+        "tag":                "SCALPER",
+        "instrument_token":   instrument_key,
+        "order_type":         order_type,
+        "transaction_type":   transaction_type,
+        "disclosed_quantity": 0,
+        "trigger_price":      0,
+        "is_amo":             False,
     }
     delay = BASE_BACKOFF_S
     for attempt in range(MAX_RETRIES):
@@ -437,7 +476,7 @@ def check_daily_guardrails(session_pnl: float, trade_count: int,
 
 
 def get_htf_trend(token: str) -> int:
-    """Returns +1 (bull), -1 (bear), 0 (neutral/insufficient data) on 5-min."""
+    """Returns +1 (bull), -1 (bear), 0 (neutral) based on 5-min EMA 9/21."""
     df5 = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval="5minute")
     if df5.empty or len(df5) < 22:
         return 0
@@ -485,80 +524,71 @@ def compute_supertrend(df: pd.DataFrame, length: int = 7,
 
 
 # ==============================================================================
-# ── FIX: SIGNAL STATE MACHINE ────────────────────────────────────────────────
-# The old code required ALL 7 conditions to be True on the SAME 2-second cycle.
-# EMA crossover fires for ONE bar only — probability of it coinciding with
-# every other condition simultaneously is near zero.
-#
-# New approach: two-stage signal pipeline
-#   Stage 1 — SETUP: EMA crossover + trend/volume/supertrend detected.
-#              Stored in session_state with a bar counter.
-#   Stage 2 — CONFIRM: RSI, VWAP, OI, HTF checked on SUBSEQUENT bars.
-#              Entry fires when all Stage 2 conditions hold for SIGNAL_HOLD_BARS.
+# SIGNAL STATE MACHINE
+# Two-stage pipeline:
+#   Stage 1 — SETUP: EMA crossover + ADX trend + Supertrend latched in state.
+#   Stage 2 — CONFIRM: volume, VWAP, RSI slope, OI, HTF must hold for
+#             SIGNAL_HOLD_BARS consecutive cycles before entry fires.
+# This prevents the old problem where crossover + all conditions had to
+# coincide in the same 2-second polling window (near-zero probability).
 # ==============================================================================
 
-def evaluate_signal(df: pd.DataFrame, vwap_value: float, oi: dict,
-                    htf_trend: int) -> str:
-    """
-    Returns 'call', 'put', or 'none'.
-    Uses a two-stage pipeline stored in session_state.
-    """
+def evaluate_signal(df: pd.DataFrame, vwap_value: float,
+                    oi: dict, htf_trend: int) -> str:
+    """Returns 'call', 'put', or 'none'."""
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # ── Stage 1: Setup conditions (structural) ────────────────────────────────
-    ema_bull     = prev["EMA_9"] <= prev["EMA_21"] and last["EMA_9"] > last["EMA_21"]
-    ema_bear     = prev["EMA_9"] >= prev["EMA_21"] and last["EMA_9"] < last["EMA_21"]
-    is_trending  = float(last["ADX"]) > 25
-    is_high_vol  = float(last["volume"]) > float(last["Vol_SMA"])
-    st_bull      = int(last["ST_Direction"]) == 1
-    st_bear      = int(last["ST_Direction"]) == -1
+    # ── Stage 1: structural latch ─────────────────────────────────────────────
+    ema_bull    = prev["EMA_9"] <= prev["EMA_21"] and last["EMA_9"] > last["EMA_21"]
+    ema_bear    = prev["EMA_9"] >= prev["EMA_21"] and last["EMA_9"] < last["EMA_21"]
+    is_trending = float(last["ADX"]) > 25
+    st_bull     = int(last["ST_Direction"]) == 1
+    st_bear     = int(last["ST_Direction"]) == -1
 
-    # Latch: if a fresh crossover occurs, reset the pending signal
     if ema_bull and is_trending and st_bull:
-        st.session_state.pending_signal     = "call"
+        st.session_state.pending_signal      = "call"
         st.session_state.pending_signal_bars = 0
     elif ema_bear and is_trending and st_bear:
-        st.session_state.pending_signal     = "put"
+        st.session_state.pending_signal      = "put"
         st.session_state.pending_signal_bars = 0
 
     pending = st.session_state.get("pending_signal", "none")
     if pending == "none":
         return "none"
 
-    # ── Stage 2: Confirmation conditions (momentum + context) ─────────────────
+    # ── Stage 2: confirmation ─────────────────────────────────────────────────
     last_close = float(last["close"])
     rsi_now    = float(last["RSI_14"])
     rsi_prev   = float(prev["RSI_14"])
+    is_high_vol = float(last["volume"]) > float(last["Vol_SMA"])
 
-    # ── FIX: OI gate is relaxed when OI API is unavailable ───────────────────
-    oi_up = oi.get("oi_available", False)
-    if oi_up:
-        oi_confirms_call = oi["oi_surge_ce"] or (oi["pcr"] > 1.0)
-        oi_confirms_put  = oi["oi_surge_pe"] or (oi["pcr"] < 1.0)
+    # OI gate: bypassed when OI API is unavailable (prevents silent blocking)
+    if oi.get("oi_available", False):
+        oi_ok_call = oi["oi_surge_ce"] or (oi["pcr"] > 1.0)
+        oi_ok_put  = oi["oi_surge_pe"] or (oi["pcr"] < 1.0)
     else:
-        # OI API down — skip OI filter entirely, don't block the trade
-        oi_confirms_call = True
-        oi_confirms_put  = True
+        oi_ok_call = True
+        oi_ok_put  = True
 
-    htf_allows_call = htf_trend >= 0
-    htf_allows_put  = htf_trend <= 0
+    htf_ok_call = htf_trend >= 0   # bull or neutral on 5-min
+    htf_ok_put  = htf_trend <= 0   # bear or neutral on 5-min
 
     if pending == "call":
         confirmed = (
             is_high_vol
             and last_close > vwap_value
             and rsi_now > rsi_prev and 45 < rsi_now < 75
-            and oi_confirms_call
-            and htf_allows_call
+            and oi_ok_call
+            and htf_ok_call
         )
     elif pending == "put":
         confirmed = (
             is_high_vol
             and last_close < vwap_value
             and rsi_now < rsi_prev and 25 < rsi_now < 55
-            and oi_confirms_put
-            and htf_allows_put
+            and oi_ok_put
+            and htf_ok_put
         )
     else:
         confirmed = False
@@ -567,13 +597,12 @@ def evaluate_signal(df: pd.DataFrame, vwap_value: float, oi: dict,
         st.session_state.pending_signal_bars = \
             st.session_state.get("pending_signal_bars", 0) + 1
     else:
-        # Confirmation failed — reset pending
         st.session_state.pending_signal      = "none"
         st.session_state.pending_signal_bars = 0
         return "none"
 
     if st.session_state.pending_signal_bars >= SIGNAL_HOLD_BARS:
-        fired  = pending
+        fired = pending
         st.session_state.pending_signal      = "none"
         st.session_state.pending_signal_bars = 0
         return fired
@@ -626,8 +655,8 @@ st.sidebar.markdown("---")
 st.sidebar.header("🛡️ Risk Guardrails")
 MAX_DAILY_LOSS = st.sidebar.number_input("Daily Loss Limit (₹)", value=DEFAULT_MAX_DAILY_LOSS,
                                           step=500, min_value=500)
-MAX_TRADES     = st.sidebar.number_input("Max Trades / Day",      value=DEFAULT_MAX_TRADES,
-                                          step=1,   min_value=1)
+MAX_TRADES     = st.sidebar.number_input("Max Trades / Day", value=DEFAULT_MAX_TRADES,
+                                          step=1, min_value=1)
 
 st.sidebar.markdown("---")
 TRADE_MODE = st.sidebar.radio(
@@ -659,14 +688,14 @@ m1, m2, m3, m4, m5, m6 = st.columns(6)
 nifty_spot  = fetch_ltp(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") if ACCESS_TOKEN else None
 trade_count = len(st.session_state.trade_logs)
 
-m1.metric("📊 Nifty Spot",    f"₹{nifty_spot:,.2f}" if nifty_spot else "—")
-m2.metric("💰 Balance",       f"₹{current_capital:,.2f}")
-m3.metric("📈 Session PnL",   f"₹{st.session_state.session_pnl:,.2f}",
+m1.metric("📊 Nifty Spot",   f"₹{nifty_spot:,.2f}" if nifty_spot else "—")
+m2.metric("💰 Balance",      f"₹{current_capital:,.2f}")
+m3.metric("📈 Session PnL",  f"₹{st.session_state.session_pnl:,.2f}",
           delta=f"{(st.session_state.session_pnl/INITIAL_CAPITAL*100):.2f}%" if INITIAL_CAPITAL else "0%")
-m4.metric("🛡️ Mode",          "LIVE" if not IS_PAPER else "PAPER")
-m5.metric("🔴 Loss Streak",   f"{st.session_state.loss_streak} / {MAX_LOSS_STREAK}",
+m4.metric("🛡️ Mode",         "LIVE" if not IS_PAPER else "PAPER")
+m5.metric("🔴 Loss Streak",  f"{st.session_state.loss_streak} / {MAX_LOSS_STREAK}",
           delta="⚠️ At limit!" if st.session_state.loss_streak >= MAX_LOSS_STREAK - 1 else None)
-m6.metric("📋 Trades Today",  f"{trade_count} / {MAX_TRADES}",
+m6.metric("📋 Trades Today", f"{trade_count} / {MAX_TRADES}",
           delta="⚠️ Near limit!" if trade_count >= MAX_TRADES - 1 else None)
 
 # ── Session window banner ──────────────────────────────────────────────────────
@@ -675,13 +704,13 @@ if in_prime_session():
 else:
     st.warning(f"🕐 **Outside Prime Window** ({ist_time_str()}) — next: {next_window_str()}")
 
-# ── Pending signal state indicator ────────────────────────────────────────────
+# ── Pending signal indicator ───────────────────────────────────────────────────
 pending = st.session_state.get("pending_signal", "none")
 if pending != "none":
-    bars = st.session_state.get("pending_signal_bars", 0)
-    direction_label = "📈 CALL" if pending == "call" else "📉 PUT"
-    st.info(f"⏳ **Stage 1 setup latched: {direction_label}** — confirming… "
-            f"({bars}/{SIGNAL_HOLD_BARS} bars)")
+    bars  = st.session_state.get("pending_signal_bars", 0)
+    dlbl  = "📈 CALL" if pending == "call" else "📉 PUT"
+    st.info(f"⏳ **Stage 1 latched: {dlbl}** — confirming "
+            f"({bars}/{SIGNAL_HOLD_BARS} bars confirmed)")
 
 st.markdown("---")
 
@@ -721,10 +750,9 @@ with col_ctrl:
 
 with col_oi:
     st.subheader("📊 OI Intelligence")
-    # ── FIX: fetch OI eagerly for display even before first loop cycle ─────────
+    # Eagerly fetch OI for display even before first algo loop cycle
     if ACCESS_TOKEN and not st.session_state.get("oi_snapshot") and nifty_spot:
-        _spot = nifty_spot or 24000.0
-        fetch_option_chain_oi(ACCESS_TOKEN, _spot)
+        fetch_option_chain_oi(ACCESS_TOKEN, nifty_spot)
 
     snap = st.session_state.get("oi_snapshot", {})
     if snap:
@@ -735,7 +763,8 @@ with col_oi:
         o1.metric("CE OI", f"{ce_oi/1e5:.2f}L")
         o2.metric("PE OI", f"{pe_oi/1e5:.2f}L")
         pcr_icon = "🟢" if pcr > 1.2 else "🔴" if pcr < 0.8 else "🟡"
-        st.metric("PCR", f"{pcr_icon} {pcr:.2f}", help="PCR > 1.2 = bullish, < 0.8 = bearish")
+        st.metric("PCR", f"{pcr_icon} {pcr:.2f}",
+                  help="PCR > 1.2 = bullish, < 0.8 = bearish")
         hist = st.session_state.get("oi_history", [])
         if len(hist) > 1:
             st.line_chart(pd.DataFrame(hist).tail(15)[["ce_oi", "pe_oi"]],
@@ -819,7 +848,7 @@ if st.session_state.bot_active and ACCESS_TOKEN:
     htf_trend = get_htf_trend(ACCESS_TOKEN)
     master    = load_instrument_master()
 
-    # ── Signal state machine ──────────────────────────────────────────────────
+    # ── Signal evaluation ─────────────────────────────────────────────────────
     if st.session_state.current_position is None:
         signal = evaluate_signal(df, vwap_value, oi, htf_trend)
 
@@ -895,7 +924,7 @@ if st.session_state.bot_active and ACCESS_TOKEN:
     st.rerun()
 
 # ==============================================================================
-# TRADE LOG + STATS
+# TRADE LOG + SESSION STATS
 # ==============================================================================
 st.markdown("---")
 st.subheader("📑 Session Trade Log")
@@ -945,4 +974,3 @@ if st.session_state.order_log:
 if st.session_state.get("api_errors"):
     with st.expander(f"⚠️ API Error Log ({len(st.session_state.api_errors)} errors)"):
         st.dataframe(pd.DataFrame(st.session_state.api_errors), use_container_width=True)
-
