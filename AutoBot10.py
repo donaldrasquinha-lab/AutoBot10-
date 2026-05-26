@@ -30,9 +30,6 @@ PRIME_WINDOWS = [
     ("13:30", "14:45"),
 ]
 
-# ── Signal state machine: bars confirmation must hold before entry ────────────
-SIGNAL_HOLD_BARS = 2
-
 # ==============================================================================
 # RATE-LIMIT AWARE HTTP CLIENT
 # ==============================================================================
@@ -603,36 +600,16 @@ def check_daily_guardrails(session_pnl: float, trade_count: int,
     return True, ""
 
 
-def get_htf_trend(token: str) -> int:
-    """Returns +1 (bull), -1 (bear), 0 (neutral) based on 5-min EMA 9/21."""
-    df5 = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval="5minute")
-    if df5.empty or len(df5) < 22:
-        return 0
-    df5["EMA_9"]  = ta.trend.ema_indicator(df5["close"], window=9)
-    df5["EMA_21"] = ta.trend.ema_indicator(df5["close"], window=21)
-    last5 = df5.iloc[-1]
-    if last5["EMA_9"] > last5["EMA_21"]:
-        return 1
-    if last5["EMA_9"] < last5["EMA_21"]:
-        return -1
-    return 0
-
-
-def compute_atr_sl_target(df: pd.DataFrame, entry_ltp: float,
-                           atr_multiplier: float, rr_min: float,
-                           delta: float = 0.5) -> tuple[float, float] | None:
-    atr     = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
-    atr_val = float(atr.dropna().iloc[-1]) if not atr.dropna().empty else 0
-    if atr_val <= 0:
-        return None
-    sl_distance  = atr_val * atr_multiplier * delta
-    tgt_distance = sl_distance * rr_min
-    sl_price     = entry_ltp - sl_distance
-    target_price = entry_ltp + tgt_distance
-    if sl_price <= 0 or sl_price >= entry_ltp:
-        return None
-    return round(sl_price, 2), round(target_price, 2)
-
+# ==============================================================================
+# MULTI-TIMEFRAME INDICATOR ENGINE
+# Architecture:
+#   1H  bars → Trend direction  (EMA 20/50, ADX, Supertrend)
+#   15M bars → Momentum confirm (EMA 9/21 state, RSI, VWAP side)
+#   3M  bars → Trade trigger    (EMA 9/21 state, volume surge, RSI slope)
+#
+# FIX applied: EMA STATE (EMA_fast > EMA_slow) used everywhere — NOT crossover.
+# State is true for many bars during a trend, giving realistic signal frequency.
+# ==============================================================================
 
 def compute_supertrend(df: pd.DataFrame, length: int = 7,
                         multiplier: float = 3.0) -> pd.Series:
@@ -651,47 +628,99 @@ def compute_supertrend(df: pd.DataFrame, length: int = 7,
     return direction
 
 
-# ==============================================================================
-# SIGNAL STATE MACHINE
-# Two-stage pipeline:
-#   Stage 1 — SETUP: EMA crossover + ADX trend + Supertrend latched in state.
-#   Stage 2 — CONFIRM: volume, VWAP, RSI slope, OI, HTF must hold for
-#             SIGNAL_HOLD_BARS consecutive cycles before entry fires.
-# This prevents the old problem where crossover + all conditions had to
-# coincide in the same 2-second polling window (near-zero probability).
-# ==============================================================================
+def compute_atr_sl_target(df, entry_ltp, atr_multiplier, rr_min, delta=0.5):
+    atr     = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
+    atr_val = float(atr.dropna().iloc[-1]) if not atr.dropna().empty else 0
+    if atr_val <= 0:
+        return None
+    sl_distance  = atr_val * atr_multiplier * delta
+    tgt_distance = sl_distance * rr_min
+    sl_price     = entry_ltp - sl_distance
+    target_price = entry_ltp + tgt_distance
+    if sl_price <= 0 or sl_price >= entry_ltp:
+        return None
+    return round(sl_price, 2), round(target_price, 2)
 
-def evaluate_signal(df: pd.DataFrame, vwap_value: float,
-                    oi: dict, htf_trend: int) -> str:
-    """Returns 'call', 'put', or 'none'."""
+
+def get_tf_data(token: str, interval: str, min_bars: int):
+    """Fetch candles for a given interval. Returns (df, ok: bool)."""
+    df = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval=interval)
+    if df.empty or len(df) < min_bars:
+        return pd.DataFrame(), False
+    return df, True
+
+
+def build_1h_trend(token: str) -> dict:
+    """
+    1-Hour timeframe — TREND LAYER.
+    Determines overall market direction.
+    Indicators: EMA 20/50 state, ADX 14, Supertrend (7,3).
+    Returns dict of filter states + direction (+1 bull, -1 bear, 0 neutral).
+    """
+    df, ok = get_tf_data(token, "60minute", 55)
+    if not ok:
+        return {"ok": False, "direction": 0, "filters": {}}
+
+    df["EMA_20"] = ta.trend.ema_indicator(df["close"], window=20)
+    df["EMA_50"] = ta.trend.ema_indicator(df["close"], window=50)
+    df["ADX"]    = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
+    df["ST"]     = compute_supertrend(df)
+
     last = df.iloc[-1]
-    prev = df.iloc[-2]
+    ema_bull  = float(last["EMA_20"]) > float(last["EMA_50"])
+    ema_bear  = float(last["EMA_20"]) < float(last["EMA_50"])
+    adx_trend = float(last["ADX"]) > 20      # 20 on 1H is sufficient (less noise)
+    st_bull   = int(last["ST"]) == 1
+    st_bear   = int(last["ST"]) == -1
 
-    # ── Stage 1: structural latch ─────────────────────────────────────────────
-    ema_bull    = prev["EMA_9"] <= prev["EMA_21"] and last["EMA_9"] > last["EMA_21"]
-    ema_bear    = prev["EMA_9"] >= prev["EMA_21"] and last["EMA_9"] < last["EMA_21"]
-    is_trending = float(last["ADX"]) > 25
-    st_bull     = int(last["ST_Direction"]) == 1
-    st_bear     = int(last["ST_Direction"]) == -1
+    if ema_bull and adx_trend and st_bull:
+        direction = 1
+    elif ema_bear and adx_trend and st_bear:
+        direction = -1
+    else:
+        direction = 0
 
-    if ema_bull and is_trending and st_bull:
-        st.session_state.pending_signal      = "call"
-        st.session_state.pending_signal_bars = 0
-    elif ema_bear and is_trending and st_bear:
-        st.session_state.pending_signal      = "put"
-        st.session_state.pending_signal_bars = 0
+    filters = {
+        "EMA 20>50 (bull)":  ema_bull,
+        "EMA 20<50 (bear)":  ema_bear,
+        "ADX > 20":          adx_trend,
+        "Supertrend bull":   st_bull,
+        "Supertrend bear":   st_bear,
+    }
+    return {
+        "ok": True, "direction": direction, "filters": filters,
+        "ema20": float(last["EMA_20"]), "ema50": float(last["EMA_50"]),
+        "adx": float(last["ADX"]), "st": int(last["ST"]),
+        "close": float(last["close"]),
+    }
 
-    pending = st.session_state.get("pending_signal", "none")
-    if pending == "none":
-        return "none"
 
-    # ── Stage 2: confirmation ─────────────────────────────────────────────────
-    last_close = float(last["close"])
-    rsi_now    = float(last["RSI_14"])
-    rsi_prev   = float(prev["RSI_14"])
-    is_high_vol = float(last["volume"]) > float(last["Vol_SMA"])
+def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -> dict:
+    """
+    15-Minute timeframe — MOMENTUM LAYER.
+    Confirms the 1H trend has momentum behind it.
+    Indicators: EMA 9/21 state, RSI 14, VWAP side, OI/PCR.
+    Only evaluated when 1H direction is non-zero.
+    """
+    df, ok = get_tf_data(token, "15minute", 25)
+    if not ok:
+        return {"ok": False, "confirmed": False, "filters": {}}
 
-    # OI gate: bypassed when OI API is unavailable (prevents silent blocking)
+    df["EMA_9"]  = ta.trend.ema_indicator(df["close"], window=9)
+    df["EMA_21"] = ta.trend.ema_indicator(df["close"], window=21)
+    df["RSI"]    = ta.momentum.rsi(df["close"], window=14)
+
+    last = df.iloc[-1]
+    ema_state_bull = float(last["EMA_9"]) > float(last["EMA_21"])
+    ema_state_bear = float(last["EMA_9"]) < float(last["EMA_21"])
+    rsi_val        = float(last["RSI"])
+    rsi_mid_bull   = 50 < rsi_val < 75    # above midpoint, not overbought
+    rsi_mid_bear   = 25 < rsi_val < 50    # below midpoint, not oversold
+    close_15m      = float(last["close"])
+    above_vwap     = close_15m > vwap_value
+    below_vwap     = close_15m < vwap_value
+
+    # OI gate — bypassed if API unavailable
     if oi.get("oi_available", False):
         oi_ok_call = oi["oi_surge_ce"] or (oi["pcr"] > 1.0)
         oi_ok_put  = oi["oi_surge_pe"] or (oi["pcr"] < 1.0)
@@ -699,46 +728,140 @@ def evaluate_signal(df: pd.DataFrame, vwap_value: float,
         oi_ok_call = True
         oi_ok_put  = True
 
-    htf_ok_call = htf_trend >= 0   # bull or neutral on 5-min
-    htf_ok_put  = htf_trend <= 0   # bear or neutral on 5-min
-
-    if pending == "call":
-        confirmed = (
-            is_high_vol
-            and last_close > vwap_value
-            and rsi_now > rsi_prev and 45 < rsi_now < 75
-            and oi_ok_call
-            and htf_ok_call
-        )
-    elif pending == "put":
-        confirmed = (
-            is_high_vol
-            and last_close < vwap_value
-            and rsi_now < rsi_prev and 25 < rsi_now < 55
-            and oi_ok_put
-            and htf_ok_put
-        )
+    if trend_dir == 1:
+        confirmed = ema_state_bull and rsi_mid_bull and above_vwap and oi_ok_call
+        filters = {
+            "EMA 9>21 (bull state)": ema_state_bull,
+            "RSI 50–75":             rsi_mid_bull,
+            "Price > VWAP":          above_vwap,
+            "OI/PCR confirms call":  oi_ok_call,
+        }
+    elif trend_dir == -1:
+        confirmed = ema_state_bear and rsi_mid_bear and below_vwap and oi_ok_put
+        filters = {
+            "EMA 9<21 (bear state)": ema_state_bear,
+            "RSI 25–50":             rsi_mid_bear,
+            "Price < VWAP":          below_vwap,
+            "OI/PCR confirms put":   oi_ok_put,
+        }
     else:
         confirmed = False
+        filters = {"No trend on 1H": False}
 
-    if confirmed:
-        st.session_state.pending_signal_bars = \
-            st.session_state.get("pending_signal_bars", 0) + 1
+    return {
+        "ok": True, "confirmed": confirmed, "filters": filters,
+        "ema9": float(last["EMA_9"]), "ema21": float(last["EMA_21"]),
+        "rsi": rsi_val, "close": close_15m,
+    }
+
+
+def build_3m_trigger(token: str, trend_dir: int) -> dict:
+    """
+    3-Minute timeframe — ENTRY TRIGGER LAYER.
+    Fine-tunes exact entry timing. Only evaluated when 1H + 15M agree.
+    Indicators: EMA 9/21 state (aligned with trend), volume surge, RSI slope.
+    Uses STATE not crossover — avoids the timing coincidence problem entirely.
+    """
+    df, ok = get_tf_data(token, "3minute", 25)
+    if not ok:
+        return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
+
+    df["EMA_9"]   = ta.trend.ema_indicator(df["close"], window=9)
+    df["EMA_21"]  = ta.trend.ema_indicator(df["close"], window=21)
+    df["RSI"]     = ta.momentum.rsi(df["close"], window=14)
+    df["Vol_SMA"] = df["volume"].rolling(window=20).mean()
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    ema_state_bull = float(last["EMA_9"]) > float(last["EMA_21"])
+    ema_state_bear = float(last["EMA_9"]) < float(last["EMA_21"])
+    rsi_now        = float(last["RSI"])
+    rsi_prev       = float(prev["RSI"])
+    rsi_rising     = rsi_now > rsi_prev and 45 < rsi_now < 78
+    rsi_falling    = rsi_now < rsi_prev and 22 < rsi_now < 55
+    vol_surge      = float(last["volume"]) > float(last["Vol_SMA"])
+
+    if trend_dir == 1:
+        triggered = ema_state_bull and rsi_rising and vol_surge
+        filters = {
+            "EMA 9>21 (bull state)": ema_state_bull,
+            "RSI rising 45–78":      rsi_rising,
+            "Volume surge":          vol_surge,
+        }
+    elif trend_dir == -1:
+        triggered = ema_state_bear and rsi_falling and vol_surge
+        filters = {
+            "EMA 9<21 (bear state)": ema_state_bear,
+            "RSI falling 22–55":     rsi_falling,
+            "Volume surge":          vol_surge,
+        }
     else:
-        st.session_state.pending_signal      = "none"
-        st.session_state.pending_signal_bars = 0
-        return "none"
+        triggered = False
+        filters = {"No trend direction": False}
 
-    if st.session_state.pending_signal_bars >= SIGNAL_HOLD_BARS:
-        fired = pending
-        st.session_state.pending_signal      = "none"
-        st.session_state.pending_signal_bars = 0
-        return fired
+    return {
+        "ok": True, "triggered": triggered, "filters": filters,
+        "ema9": float(last["EMA_9"]), "ema21": float(last["EMA_21"]),
+        "rsi": rsi_now, "df": df,
+    }
 
-    return "none"
+
+def evaluate_mtf_signal(token: str, vwap_value: float, oi: dict) -> tuple:
+    """
+    Master MTF evaluator. Runs all three timeframe layers in sequence.
+    Returns (signal: str, tf_data: dict) where signal is 'call'/'put'/'none'.
+    tf_data carries all filter states for the dashboard status panel.
+    Short-circuits: if 1H is neutral, 15M and 3M are not fetched.
+    """
+    tf = {}
+
+    # ── Layer 1: 1H Trend ────────────────────────────────────────────────────
+    tf["1h"] = build_1h_trend(token)
+    trend_dir = tf["1h"].get("direction", 0)
+
+    if trend_dir == 0:
+        tf["15m"] = {"ok": False, "confirmed": False, "filters": {"Waiting for 1H trend": False}}
+        tf["3m"]  = {"ok": False, "triggered": False, "filters": {"Waiting for 1H trend": False}, "df": pd.DataFrame()}
+        return "none", tf
+
+    # ── Layer 2: 15M Momentum ────────────────────────────────────────────────
+    tf["15m"] = build_15m_confirm(token, trend_dir, vwap_value, oi)
+    if not tf["15m"]["confirmed"]:
+        tf["3m"] = {"ok": False, "triggered": False, "filters": {"Waiting for 15M confirm": False}, "df": pd.DataFrame()}
+        return "none", tf
+
+    # ── Layer 3: 3M Trigger ──────────────────────────────────────────────────
+    tf["3m"] = build_3m_trigger(token, trend_dir)
+    if not tf["3m"]["triggered"]:
+        return "none", tf
+
+    signal = "call" if trend_dir == 1 else "put"
+    return signal, tf
 
 
 # ==============================================================================
+# SESSION STATE BOOTSTRAP
+# ==============================================================================
+st.set_page_config(page_title="Upstox Algo Scalper", layout="wide")
+
+defaults = {
+    "bot_active":       False,
+    "current_position": None,
+    "trade_logs":       [],
+    "session_pnl":      0.0,
+    "loss_streak":      0,
+    "oi_snapshot":      {},
+    "oi_history":       [],
+    "order_log":        [],
+    "api_last_call":    {},
+    "api_errors":       [],
+    "last_tf_data":     {},
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
 # SESSION STATE BOOTSTRAP
 # ==============================================================================
 st.set_page_config(page_title="Upstox Algo Scalper", layout="wide")
@@ -754,8 +877,6 @@ defaults = {
     "order_log":           [],
     "api_last_call":       {},
     "api_errors":          [],
-    "pending_signal":      "none",
-    "pending_signal_bars": 0,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -969,6 +1090,81 @@ with col_pos:
 # ==============================================================================
 # ALGORITHMIC LOOP ENGINE
 # ==============================================================================
+# ==============================================================================
+# MTF FILTER STATUS PANEL — always visible when token is present
+# ==============================================================================
+if ACCESS_TOKEN:
+    st.markdown("---")
+    st.subheader("📡 Multi-Timeframe Filter Status")
+
+    tf_data = st.session_state.get("last_tf_data", {})
+
+    col_1h, col_15m, col_3m = st.columns(3)
+
+    def _filter_rows(filters: dict, label: str):
+        """Render a filter status card for one timeframe."""
+        all_pass = all(filters.values()) if filters else False
+        status_icon = "🟢" if all_pass else "🔴"
+        st.markdown(f"**{status_icon} {label}**")
+        for name, passed in filters.items():
+            icon = "✅" if passed else "❌"
+            st.caption(f"{icon} {name}")
+
+    with col_1h:
+        h1 = tf_data.get("1h", {})
+        dir_map = {1: "📈 Bullish", -1: "📉 Bearish", 0: "➡️ Neutral"}
+        direction = h1.get("direction", 0)
+        st.markdown(f"**1H Trend — {dir_map.get(direction, '—')}**")
+        if h1.get("ok"):
+            st.caption(f"EMA20: {h1.get('ema20', 0):.1f} | EMA50: {h1.get('ema50', 0):.1f}")
+            st.caption(f"ADX: {h1.get('adx', 0):.1f} | ST: {'▲' if h1.get('st') == 1 else '▼'}")
+            for name, passed in h1.get("filters", {}).items():
+                icon = "✅" if passed else "❌"
+                st.caption(f"{icon} {name}")
+        else:
+            st.caption("⏳ Waiting for data (need 55 bars)")
+
+    with col_15m:
+        m15 = tf_data.get("15m", {})
+        confirmed = m15.get("confirmed", False)
+        st.markdown(f"**15M Momentum — {'🟢 Confirmed' if confirmed else '🔴 Not confirmed'}**")
+        if m15.get("ok"):
+            st.caption(f"EMA9: {m15.get('ema9', 0):.1f} | EMA21: {m15.get('ema21', 0):.1f}")
+            st.caption(f"RSI: {m15.get('rsi', 0):.1f}")
+            for name, passed in m15.get("filters", {}).items():
+                icon = "✅" if passed else "❌"
+                st.caption(f"{icon} {name}")
+        else:
+            st.caption("⏳ Waiting for 1H trend first")
+
+    with col_3m:
+        m3 = tf_data.get("3m", {})
+        triggered = m3.get("triggered", False)
+        st.markdown(f"**3M Trigger — {'🟢 FIRE' if triggered else '🔴 Waiting'}**")
+        if m3.get("ok"):
+            st.caption(f"EMA9: {m3.get('ema9', 0):.1f} | EMA21: {m3.get('ema21', 0):.1f}")
+            st.caption(f"RSI: {m3.get('rsi', 0):.1f}")
+            for name, passed in m3.get("filters", {}).items():
+                icon = "✅" if passed else "❌"
+                st.caption(f"{icon} {name}")
+        else:
+            st.caption("⏳ Waiting for 15M confirm first")
+
+    # Overall signal readiness bar
+    h1_ok  = tf_data.get("1h",  {}).get("direction", 0) != 0
+    m15_ok = tf_data.get("15m", {}).get("confirmed", False)
+    m3_ok  = tf_data.get("3m",  {}).get("triggered", False)
+    layers_passed = sum([h1_ok, m15_ok, m3_ok])
+    bar_colors = ["🟥", "🟧", "🟨", "🟩"]
+    st.caption(
+        f"Signal readiness: {bar_colors[layers_passed]} "
+        f"{layers_passed}/3 layers passed "
+        f"({'Entry armed — RR check next' if layers_passed == 3 else 'Monitoring…'})"
+    )
+
+# ==============================================================================
+# ALGORITHMIC LOOP ENGINE
+# ==============================================================================
 if st.session_state.bot_active and ACCESS_TOKEN:
 
     # ── Daily guardrail checks ────────────────────────────────────────────────
@@ -982,44 +1178,32 @@ if st.session_state.bot_active and ACCESS_TOKEN:
         time.sleep(30)
         st.rerun()
 
-    # ── 1-min candle data ─────────────────────────────────────────────────────
-    df = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
-    if df.empty or len(df) < 30:
-        st.warning("⏳ Waiting for ≥ 30 candles…")
-        time.sleep(5)
-        st.rerun()
-
-    # ── Indicators ────────────────────────────────────────────────────────────
-    df["EMA_9"]        = ta.trend.ema_indicator(df["close"], window=9)
-    df["EMA_21"]       = ta.trend.ema_indicator(df["close"], window=21)
-    df["Vol_SMA"]      = df["volume"].rolling(window=20).mean()
-    df["RSI_14"]       = ta.momentum.rsi(df["close"], window=14)
-    df["ADX"]          = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
-    df["ST_Direction"] = compute_supertrend(df)
-
-    last       = df.iloc[-1]
-    prev       = df.iloc[-2]
-    last_close = float(last["close"])
-
     # ── VWAP scalar ───────────────────────────────────────────────────────────
+    spot_ref  = nifty_spot or 24000.0
     live_vwap = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
     if live_vwap and live_vwap > 0:
         vwap_value = live_vwap
     else:
-        tp          = (df["high"] + df["low"] + df["close"]) / 3
-        vwap_series = (tp * df["volume"]).cumsum() / df["volume"].cumsum().replace(0, float("nan"))
-        valid       = vwap_series.dropna()
-        vwap_value  = float(valid.iloc[-1]) if not valid.empty else last_close
+        # Fallback: compute from 3M candles
+        df3_vwap = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50", interval="3minute")
+        if not df3_vwap.empty:
+            tp         = (df3_vwap["high"] + df3_vwap["low"] + df3_vwap["close"]) / 3
+            vwap_s     = (tp * df3_vwap["volume"]).cumsum() / df3_vwap["volume"].cumsum().replace(0, float("nan"))
+            valid      = vwap_s.dropna()
+            vwap_value = float(valid.iloc[-1]) if not valid.empty else spot_ref
+        else:
+            vwap_value = spot_ref
 
-    # ── OI + HTF ──────────────────────────────────────────────────────────────
-    spot_ref  = nifty_spot or last_close
-    oi        = fetch_option_chain_oi(ACCESS_TOKEN, spot_ref)
-    htf_trend = get_htf_trend(ACCESS_TOKEN)
-    master    = load_instrument_master()
+    # ── OI snapshot ───────────────────────────────────────────────────────────
+    oi     = fetch_option_chain_oi(ACCESS_TOKEN, spot_ref)
+    master = load_instrument_master()
 
-    # ── Signal evaluation ─────────────────────────────────────────────────────
+    # ── MTF signal evaluation ─────────────────────────────────────────────────
     if st.session_state.current_position is None:
-        signal = evaluate_signal(df, vwap_value, oi, htf_trend)
+        signal, tf_data = evaluate_mtf_signal(ACCESS_TOKEN, vwap_value, oi)
+
+        # Store for the filter status panel (rerenders even when no trade)
+        st.session_state.last_tf_data = tf_data
 
         if signal in ("call", "put"):
             ot            = "CE" if signal == "call" else "PE"
@@ -1029,7 +1213,9 @@ if st.session_state.bot_active and ACCESS_TOKEN:
             if entry_ltp is None or entry_ltp <= 0:
                 st.warning(f"⚠️ No valid LTP for {isymbol} — skipping.")
             else:
-                atr_levels = compute_atr_sl_target(df, entry_ltp, ATR_MULTIPLIER, RR_MIN)
+                # ATR-based SL/Target from 3M df
+                df3 = tf_data.get("3m", {}).get("df", pd.DataFrame())
+                atr_levels = compute_atr_sl_target(df3, entry_ltp, ATR_MULTIPLIER, RR_MIN)                              if not df3.empty else None
                 if atr_levels:
                     sl_price, target_price = atr_levels
                 else:
@@ -1067,18 +1253,23 @@ if st.session_state.bot_active and ACCESS_TOKEN:
                             f"RR {rr_setup:.2f} | Order: {order_id}"
                         )
                         st.rerun()
+        else:
+            # No signal — still update tf_data for dashboard
+            st.session_state.last_tf_data = tf_data
 
     # ── Position management ───────────────────────────────────────────────────
     else:
         pos     = st.session_state.current_position
         pos_ltp = fetch_ltp(ACCESS_TOKEN, pos["key"])
         if pos_ltp is None:
-            st.warning("⚠️ LTP fetch failed — retrying next cycle.")
+            st.warning("⚠️ LTP fetch failed — retrying.")
         else:
             if pos_ltp > pos["highest_price"]:
                 st.session_state.current_position["highest_price"] = pos_ltp
-                atr_levels = compute_atr_sl_target(df, pos_ltp, ATR_MULTIPLIER, RR_MIN)
-                new_sl     = atr_levels[0] if atr_levels else pos_ltp * (1 - STOP_LOSS_PCT)
+                # Use fresh 3M ATR for trailing SL
+                df3_trail = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50", interval="3minute")
+                atr_levels = compute_atr_sl_target(df3_trail, pos_ltp, ATR_MULTIPLIER, RR_MIN)                              if not df3_trail.empty else None
+                new_sl = atr_levels[0] if atr_levels else pos_ltp * (1 - STOP_LOSS_PCT)
                 if new_sl > pos["sl_price"]:
                     st.session_state.current_position["sl_price"] = new_sl
 
@@ -1089,10 +1280,9 @@ if st.session_state.bot_active and ACCESS_TOKEN:
                 exit_position(ACCESS_TOKEN, pos, pos_ltp, reason, IS_PAPER, LOT_SIZE)
                 st.rerun()
 
-    time.sleep(2)
+    time.sleep(3)
     st.rerun()
 
-# ==============================================================================
 # TRADE LOG + SESSION STATS
 # ==============================================================================
 st.markdown("---")
