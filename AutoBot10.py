@@ -723,12 +723,25 @@ def build_1h_trend(token: str) -> dict:
     else:
         direction = 0
 
-    filters = {
-        "EMA 20>50 (bull)": ema_bull,
-        "EMA 20<50 (bear)": ema_bear,
-        "Supertrend bull":  st_bull,
-        "Supertrend bear":  st_bear,
-    }
+    # Only show filters relevant to the detected direction
+    if direction == 1:
+        filters = {
+            "EMA 20 > EMA 50": ema_bull,
+            "Supertrend bull":  st_bull,
+        }
+    elif direction == -1:
+        filters = {
+            "EMA 20 < EMA 50": ema_bear,
+            "Supertrend bear":  st_bear,
+        }
+    else:
+        # Neutral — show why both directions failed
+        filters = {
+            "EMA 20 > EMA 50 (bull need)": ema_bull,
+            "Supertrend bull (bull need)":  st_bull,
+            "EMA 20 < EMA 50 (bear need)":  ema_bear,
+            "Supertrend bear (bear need)":  st_bear,
+        }
     return {
         "ok": True, "direction": direction, "filters": filters,
         "ema20": float(last["EMA_20"]), "ema50": float(last["EMA_50"]),
@@ -1152,23 +1165,24 @@ if ACCESS_TOKEN:
     st.markdown("---")
     st.subheader("📡 Multi-Timeframe Filter Status")
 
-    # ── Eagerly fetch 1H data for the panel even when bot is idle ─────────────
-    # The algo loop only runs when bot_active=True, but the panel should always
-    # show live data so you can see what the market is doing before starting.
-    if not st.session_state.bot_active:
-        _vwap_panel = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") or 0.0
-        _oi_panel   = st.session_state.get("oi_snapshot", {})
-        _oi_dict    = {
-            "oi_available": bool(_oi_panel),
-            "oi_surge_ce": False, "oi_surge_pe": False,
-            "pcr": (_oi_panel.get("pe_oi", 0) / _oi_panel.get("ce_oi", 1))
-                   if _oi_panel.get("ce_oi", 0) > 0 else 1.0,
-        }
-        _spot_panel = nifty_spot or 24000.0
-        _signal, _tf = evaluate_mtf_signal(ACCESS_TOKEN, _vwap_panel or _spot_panel, _oi_dict)
-        st.session_state.last_tf_data = _tf
-
-    tf_data = st.session_state.get("last_tf_data", {})
+    # ── Always fetch fresh MTF data for the panel on every render ───────────────
+    # Do NOT read stale last_tf_data — always run a fresh evaluation so the
+    # panel reflects the current market state regardless of bot_active status.
+    _vwap_panel = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") or 0.0
+    _oi_panel   = st.session_state.get("oi_snapshot", {})
+    _oi_dict    = {
+        "oi_available": bool(_oi_panel),
+        "oi_surge_ce":  False,
+        "oi_surge_pe":  False,
+        "pcr": (_oi_panel.get("pe_oi", 0) / _oi_panel.get("ce_oi", 1))
+               if _oi_panel.get("ce_oi", 0) > 0 else 1.0,
+    }
+    _spot_panel  = nifty_spot or 24000.0
+    _signal_p, _tf_p = evaluate_mtf_signal(
+        ACCESS_TOKEN, _vwap_panel or _spot_panel, _oi_dict
+    )
+    st.session_state.last_tf_data = _tf_p
+    tf_data = _tf_p
 
     # ── Manual refresh button ─────────────────────────────────────────────────
     if st.button("🔄 Refresh MTF Status", key="mtf_refresh"):
