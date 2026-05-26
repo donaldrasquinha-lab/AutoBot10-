@@ -793,6 +793,9 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
         "ok": True, "confirmed": confirmed, "filters": filters,
         "ema9": float(last["EMA_9"]), "ema21": float(last["EMA_21"]),
         "rsi": rsi_val, "close": close_15m,
+        "vwap": vwap_value,
+        "pcr": oi.get("pcr", 0),
+        "oi_available": oi.get("oi_available", False),
     }
 
 
@@ -848,8 +851,14 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
 
     return {
         "ok": True, "triggered": triggered, "filters": filters,
-        "ema9": float(last["EMA_9"]), "ema21": float(last["EMA_21"]),
-        "rsi": rsi_now, "adx": float(last["ADX"]), "df": df,
+        "ema9":     float(last["EMA_9"]),
+        "ema21":    float(last["EMA_21"]),
+        "rsi":      rsi_now,
+        "rsi_prev": rsi_prev,
+        "adx":      float(last["ADX"]),
+        "vol":      float(last["volume"]),
+        "vol_sma":  float(last["Vol_SMA"]) if not pd.isna(last["Vol_SMA"]) else 0.0,
+        "df":       df,
     }
 
 
@@ -1205,26 +1214,76 @@ if ACCESS_TOKEN:
     with col_15m:
         m15 = tf_data.get("15m", {})
         confirmed = m15.get("confirmed", False)
+        h1_dir    = tf_data.get("1h", {}).get("direction", 0)
         st.markdown(f"**15M Momentum — {'🟢 Confirmed' if confirmed else '🔴 Not confirmed'}**")
         if m15.get("ok"):
-            st.caption(f"EMA9: {m15.get('ema9', 0):.1f} | EMA21: {m15.get('ema21', 0):.1f}")
-            st.caption(f"RSI: {m15.get('rsi', 0):.1f}")
-            for name, passed in m15.get("filters", {}).items():
-                icon = "✅" if passed else "❌"
-                st.caption(f"{icon} {name}")
+            ema9_v  = m15.get("ema9",  0)
+            ema21_v = m15.get("ema21", 0)
+            rsi_v   = m15.get("rsi",   0)
+            close_v = m15.get("close", 0)
+            vwap_v  = m15.get("vwap",  0)
+            pcr_v   = m15.get("pcr",   0)
+            ema_ok  = ema9_v > ema21_v if h1_dir == 1 else ema9_v < ema21_v
+            rsi_ok  = (50 < rsi_v < 75) if h1_dir == 1 else (25 < rsi_v < 50)
+            vwap_ok = close_v > vwap_v  if h1_dir == 1 else close_v < vwap_v
+            oi_ok   = m15.get("oi_available", False)
+
+            st.caption(
+                f"EMA9: {ema9_v:.1f} {'>' if ema_ok else '<'} EMA21: {ema21_v:.1f} "
+                f"{'✅' if ema_ok else '❌'}"
+            )
+            st.caption(
+                f"RSI: {rsi_v:.1f} "
+                f"({'need 50–75' if h1_dir == 1 else 'need 25–50'}) "
+                f"{'✅' if rsi_ok else '❌'}"
+            )
+            st.caption(
+                f"Close: {close_v:.1f} vs VWAP: {vwap_v:.1f} "
+                f"{'✅' if vwap_ok else '❌'}"
+            )
+            if m15.get("oi_available"):
+                st.caption(f"PCR: {pcr_v:.2f} ✅")
+            else:
+                st.caption("OI: bypassed (API unavailable) ✅")
         else:
             st.caption("⏳ Waiting for 1H trend first")
 
     with col_3m:
         m3 = tf_data.get("3m", {})
         triggered = m3.get("triggered", False)
+        h1_dir    = tf_data.get("1h", {}).get("direction", 0)
         st.markdown(f"**3M Trigger — {'🟢 FIRE' if triggered else '🔴 Waiting'}**")
         if m3.get("ok"):
-            st.caption(f"EMA9: {m3.get('ema9', 0):.1f} | EMA21: {m3.get('ema21', 0):.1f}")
-            st.caption(f"RSI: {m3.get('rsi', 0):.1f} | ADX: {m3.get('adx', 0):.1f}")
-            for name, passed in m3.get("filters", {}).items():
-                icon = "✅" if passed else "❌"
-                st.caption(f"{icon} {name}")
+            ema9_v   = m3.get("ema9",  0)
+            ema21_v  = m3.get("ema21", 0)
+            rsi_v    = m3.get("rsi",   0)
+            adx_v    = m3.get("adx",   0)
+            vol_v    = m3.get("vol",   0)
+            volsma_v = m3.get("vol_sma", 0)
+            rsi_prev_v = m3.get("rsi_prev", 0)
+
+            ema_ok  = ema9_v > ema21_v if h1_dir == 1 else ema9_v < ema21_v
+            rsi_ok  = (rsi_v > rsi_prev_v and 45 < rsi_v < 78) if h1_dir == 1                       else (rsi_v < rsi_prev_v and 22 < rsi_v < 55)
+            vol_ok  = vol_v > volsma_v
+            adx_ok  = adx_v > 20
+
+            st.caption(
+                f"EMA9: {ema9_v:.1f} {'>' if ema_ok else '<'} "
+                f"EMA21: {ema21_v:.1f} {'✅' if ema_ok else '❌'}"
+            )
+            st.caption(
+                f"RSI: {rsi_v:.1f} (prev {rsi_prev_v:.1f}) "
+                f"{'rising' if rsi_v > rsi_prev_v else 'falling'} "
+                f"{'✅' if rsi_ok else '❌'}"
+            )
+            st.caption(
+                f"Vol: {vol_v:,.0f} vs SMA: {volsma_v:,.0f} "
+                f"{'✅' if vol_ok else '❌'}"
+            )
+            st.caption(
+                f"ADX: {adx_v:.1f} (need > 20) "
+                f"{'✅' if adx_ok else '❌'}"
+            )
         else:
             st.caption("⏳ Waiting for 15M confirm first")
 
