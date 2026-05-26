@@ -363,7 +363,16 @@ def fetch_ltp_batch(token: str, instrument_keys: list[str]) -> dict:
 
 def fetch_historical_candles(token: str, instrument_key: str,
                               interval: str = "1minute") -> pd.DataFrame:
-    # instrument_key embedded in path — encode spaces as %20 for path safety
+    """
+    Fetches intraday candles. Results are cached in session_state for 30 seconds
+    per interval to avoid redundant API calls when multiple TF layers share the
+    same underlying feed (e.g. 15M and 3M both built from 1min).
+    """
+    cache_key = f"_candle_cache_{interval}"
+    cached    = st.session_state.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 30:
+        return cached["df"].copy()
+
     safe_key = instrument_key.replace(" ", "%20")
     url      = f"{UPSTOX_BASE_URL}/historical-candle/intraday/{safe_key}/{interval}"
     data     = _raw_get(token, url)
@@ -376,6 +385,7 @@ def fetch_historical_candles(token: str, instrument_key: str,
         df = df.iloc[::-1].reset_index(drop=True)
         for col in ["open", "high", "low", "close", "volume", "oi"]:
             df[col] = pd.to_numeric(df[col])
+        st.session_state[cache_key] = {"df": df, "ts": time.time()}
         return df
     except Exception:
         return pd.DataFrame()
@@ -394,17 +404,23 @@ def fetch_historical_candles_multi_day(token: str, instrument_key: str,
     safe_key  = instrument_key.replace(" ", "%20")
     to_date   = now_ist().date().strftime("%Y-%m-%d")
     from_date = (now_ist().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    url       = f"{UPSTOX_BASE_URL}/historical-candle/{safe_key}/{interval}/{to_date}/{from_date}"
-    data      = _raw_get(token, url)
+    cache_key = f"_candle_cache_multiday_{interval}"
+    cached    = st.session_state.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 300:   # 5-minute cache for 30min bars
+        return cached["df"].copy()
+
+    url  = f"{UPSTOX_BASE_URL}/historical-candle/{safe_key}/{interval}/{to_date}/{from_date}"
+    data = _raw_get(token, url)
     if data is None:
         return pd.DataFrame()
     try:
         candles = data["data"]["candles"]
         df = pd.DataFrame(candles,
                           columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
-        df = df.iloc[::-1].reset_index(drop=True)   # chronological order
+        df = df.iloc[::-1].reset_index(drop=True)
         for col in ["open", "high", "low", "close", "volume", "oi"]:
             df[col] = pd.to_numeric(df[col])
+        st.session_state[cache_key] = {"df": df, "ts": time.time()}
         return df
     except Exception:
         return pd.DataFrame()
@@ -1295,7 +1311,14 @@ if ACCESS_TOKEN:
             else:
                 st.caption("OI: bypassed (API unavailable) ✅")
         else:
-            st.caption("⏳ Waiting for 1H trend first")
+            # Show what direction was passed to determine why 15M didn't run
+            _h1_dir = tf_data.get("1h", {}).get("direction", "not set")
+            _h1_ok  = tf_data.get("1h", {}).get("ok", False)
+            st.caption(f"1H direction received: **{_h1_dir}** | 1H ok: **{_h1_ok}**")
+            if _h1_dir == 0 or _h1_dir == "not set":
+                st.caption("⚠️ 1H returned direction=0 — EMA or Supertrend not aligned on 30M bars")
+            else:
+                st.caption("⏳ 15M fetch in progress…")
 
     with col_3m:
         m3 = tf_data.get("3m", {})
