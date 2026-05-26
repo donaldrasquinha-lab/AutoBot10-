@@ -381,6 +381,35 @@ def fetch_historical_candles(token: str, instrument_key: str,
         return pd.DataFrame()
 
 
+def fetch_historical_candles_multi_day(token: str, instrument_key: str,
+                                        interval: str, days_back: int = 60) -> pd.DataFrame:
+    """
+    Fetches historical candles using the NON-intraday endpoint:
+      GET /v2/historical-candle/{key}/{interval}/{to_date}/{from_date}
+
+    Required for timeframes like 60minute where intraday-only returns < 10 bars.
+    Returns up to days_back calendar days of data, newest-last (chronological).
+    """
+    from datetime import date, timedelta
+    safe_key  = instrument_key.replace(" ", "%20")
+    to_date   = now_ist().date().strftime("%Y-%m-%d")
+    from_date = (now_ist().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    url       = f"{UPSTOX_BASE_URL}/historical-candle/{safe_key}/{interval}/{to_date}/{from_date}"
+    data      = _raw_get(token, url)
+    if data is None:
+        return pd.DataFrame()
+    try:
+        candles = data["data"]["candles"]
+        df = pd.DataFrame(candles,
+                          columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+        df = df.iloc[::-1].reset_index(drop=True)   # chronological order
+        for col in ["open", "high", "low", "close", "volume", "oi"]:
+            df[col] = pd.to_numeric(df[col])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
     """Fetches session VWAP from /market-quote/ohlc using raw URL."""
     if not token:
@@ -643,8 +672,17 @@ def compute_atr_sl_target(df, entry_ltp, atr_multiplier, rr_min, delta=0.5):
 
 
 def get_tf_data(token: str, interval: str, min_bars: int):
-    """Fetch candles for a given interval. Returns (df, ok: bool)."""
-    df = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval=interval)
+    """
+    Fetch candles for a given interval. Returns (df, ok: bool).
+    Uses multi-day historical endpoint for 60minute (intraday only has ~1-8 bars).
+    Uses intraday endpoint for 15minute and 3minute.
+    """
+    if interval == "60minute":
+        df = fetch_historical_candles_multi_day(
+            token, "NSE_INDEX|Nifty 50", interval="60minute", days_back=90
+        )
+    else:
+        df = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval=interval)
     if df.empty or len(df) < min_bars:
         return pd.DataFrame(), False
     return df, True
@@ -657,7 +695,7 @@ def build_1h_trend(token: str) -> dict:
     Indicators: EMA 20/50 state, ADX 14, Supertrend (7,3).
     Returns dict of filter states + direction (+1 bull, -1 bear, 0 neutral).
     """
-    df, ok = get_tf_data(token, "60minute", 55)
+    df, ok = get_tf_data(token, "60minute", 52)
     if not ok:
         return {"ok": False, "direction": 0, "filters": {}}
 
@@ -1122,7 +1160,7 @@ if ACCESS_TOKEN:
                 icon = "✅" if passed else "❌"
                 st.caption(f"{icon} {name}")
         else:
-            st.caption("⏳ Waiting for data (need 55 bars)")
+            st.caption("⏳ Fetching 1H history (90-day endpoint)…")
 
     with col_15m:
         m15 = tf_data.get("15m", {})
