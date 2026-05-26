@@ -387,7 +387,7 @@ def fetch_historical_candles_multi_day(token: str, instrument_key: str,
     Fetches historical candles using the NON-intraday endpoint:
       GET /v2/historical-candle/{key}/{interval}/{to_date}/{from_date}
 
-    Required for timeframes like 60minute where intraday-only returns < 10 bars.
+    Required for 30minute trend analysis — intraday endpoint only returns today's bars.
     Returns up to days_back calendar days of data, newest-last (chronological).
     """
     from datetime import date, timedelta
@@ -674,12 +674,12 @@ def compute_atr_sl_target(df, entry_ltp, atr_multiplier, rr_min, delta=0.5):
 def get_tf_data(token: str, interval: str, min_bars: int):
     """
     Fetch candles for a given interval. Returns (df, ok: bool).
-    Uses multi-day historical endpoint for 60minute (intraday only has ~1-8 bars).
+    Uses multi-day historical endpoint for 30minute (intraday only returns today's bars).
     Uses intraday endpoint for 15minute and 3minute.
     """
-    if interval == "60minute":
+    if interval == "30minute":
         df = fetch_historical_candles_multi_day(
-            token, "NSE_INDEX|Nifty 50", interval="60minute", days_back=90
+            token, "NSE_INDEX|Nifty 50", interval="30minute", days_back=60
         )
     else:
         df = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval=interval)
@@ -690,24 +690,26 @@ def get_tf_data(token: str, interval: str, min_bars: int):
 
 def build_1h_trend(token: str) -> dict:
     """
-    1-Hour timeframe — TREND LAYER.
+    30-Minute bars used as 1H proxy (Upstox historical API supports 30minute, not 60minute).
+    104 bars = ~52 trading hours of context.
+    Trend LAYER.
     Determines overall market direction.
     Indicators: EMA 20/50 state, ADX 14, Supertrend (7,3).
     Returns dict of filter states + direction (+1 bull, -1 bear, 0 neutral).
     """
-    df, ok = get_tf_data(token, "60minute", 52)
+    df, ok = get_tf_data(token, "30minute", 104)
     # Store bar count for debug display in filter panel
     st.session_state["_debug_1h_bars"] = list(range(len(df))) if not df.empty else []
     if not ok:
         return {
             "ok": False, "direction": 0, "filters": {},
-            "debug": f"{len(df)} bars received (need 52)",
+            "debug": f"{len(df)} bars received (need 104 × 30min bars = ~52 hours of context)",
         }
 
-    df["EMA_20"] = ta.trend.ema_indicator(df["close"], window=20)
-    df["EMA_50"] = ta.trend.ema_indicator(df["close"], window=50)
-    df["ADX"]    = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
-    df["ST"]     = compute_supertrend(df)
+    df["EMA_20"] = ta.trend.ema_indicator(df["close"], window=40)   # 40×30min ≈ 20×1H
+    df["EMA_50"] = ta.trend.ema_indicator(df["close"], window=100)  # 100×30min ≈ 50×1H
+    df["ADX"]    = ta.trend.adx(df["high"], df["low"], df["close"], window=28)  # 28×30min ≈ 14×1H
+    df["ST"]     = compute_supertrend(df, length=14, multiplier=3.0)  # scaled for 30min
 
     last = df.iloc[-1]
     ema_bull  = float(last["EMA_20"]) > float(last["EMA_50"])
@@ -1178,7 +1180,7 @@ if ACCESS_TOKEN:
         h1 = tf_data.get("1h", {})
         dir_map = {1: "📈 Bullish", -1: "📉 Bearish", 0: "➡️ Neutral"}
         direction = h1.get("direction", 0)
-        st.markdown(f"**1H Trend — {dir_map.get(direction, '—')}**")
+        st.markdown(f"**1H Trend (30M proxy) — {dir_map.get(direction, '—')}**")
         if h1.get("ok"):
             st.caption(f"EMA20: {h1.get('ema20', 0):.1f} | EMA50: {h1.get('ema50', 0):.1f}")
             st.caption(f"ADX: {h1.get('adx', 0):.1f} | ST: {'▲' if h1.get('st') == 1 else '▼'}")
@@ -1193,10 +1195,10 @@ if ACCESS_TOKEN:
                 _e = _h1_errs[-1]
                 st.caption(f"❌ API error {_e['status']}: {_e['body'][:120]}")
             else:
-                st.caption("⏳ Fetching 1H history (90-day endpoint)…")
+                st.caption("⏳ Fetching 30min history (60-day, multi-day endpoint)…")
                 _debug_msg = tf_data.get("1h", {}).get("debug", "")
                 bars_got   = len(st.session_state.get("_debug_1h_bars", []))
-                st.caption(f"📊 {bars_got} bars received / 52 needed")
+                st.caption(f"📊 {bars_got} bars received / 104 needed (30min × 104 = ~52hr)")
                 if _debug_msg:
                     st.caption(f"ℹ️ {_debug_msg}")
 
