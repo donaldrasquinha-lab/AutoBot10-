@@ -722,6 +722,54 @@ def resample_candles(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return pd.DataFrame(records).reset_index(drop=True)
 
 
+def build_resampled_indicators(df_1min: pd.DataFrame, n: int) -> pd.DataFrame:
+    """
+    Correct way to get Nth-minute indicators that match chart values:
+      1. Resample 1-min OHLCV into N-min candles (proper OHLCV aggregation)
+      2. Compute EMA/RSI/ADX/Volume on the resampled candles
+      3. Return the resampled df with indicator columns populated
+
+    This matches what TradingView/Upstox chart shows because RSI/EMA are
+    computed on N-minute price moves, not 1-minute price moves.
+
+    Pre-warming: enough 1-min bars exist that the resampled series has
+    sufficient history for indicators to be valid (no NaN on last row).
+    """
+    if df_1min.empty or len(df_1min) < n:
+        return pd.DataFrame()
+
+    # Step 1: Resample OHLCV into N-min bars
+    records = []
+    for i in range(0, len(df_1min) - (len(df_1min) % n), n):
+        chunk = df_1min.iloc[i : i + n]
+        records.append({
+            "timestamp": chunk["timestamp"].iloc[-1],
+            "open":      chunk["open"].iloc[0],
+            "high":      chunk["high"].max(),
+            "low":       chunk["low"].min(),
+            "close":     chunk["close"].iloc[-1],
+            "volume":    chunk["volume"].sum(),
+            "oi":        chunk["oi"].iloc[-1],
+        })
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records).reset_index(drop=True)
+
+    # Step 2: Compute indicators on the resampled bars
+    df["EMA_9"]   = ta.trend.ema_indicator(df["close"], window=9)
+    df["EMA_21"]  = ta.trend.ema_indicator(df["close"], window=21)
+    df["RSI"]     = ta.momentum.rsi(df["close"], window=14)
+    df["Vol_SMA"] = df["volume"].rolling(window=10).mean()
+    df["ADX"]     = ta.trend.adx(df["high"], df["low"], df["close"], window=7)
+
+    # Drop warm-up NaN rows — only affects early bars, last row will be valid
+    # once we have enough resampled bars (need 21 for EMA21, 14 for RSI)
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+
+
 def get_tf_data(token: str, interval: str, min_bars: int):
     """
     Fetch candles for a given interval. Returns (df, ok: bool).
@@ -819,26 +867,13 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
     Indicators: EMA 9/21 state, RSI 14, VWAP side, OI/PCR.
     Only evaluated when 1H direction is non-zero.
     """
-    # Strategy: compute indicators on full 1-min history FIRST, then resample.
-    # This eliminates NaN — EMA/RSI warm up on 100+ 1min bars, then we take
-    # every 15th close/high/low/volume to build the 15M series with valid values.
-    df_1min, ok_1min = get_tf_data(token, "1minute", 20)
+    # Fetch 1min bars and resample to proper 15M OHLCV, then compute indicators
+    # This matches chart RSI/EMA exactly — indicators computed on 15M candles
+    df_1min, ok_1min = get_tf_data(token, "1minute", 30)
     if not ok_1min:
         return {"ok": False, "confirmed": False, "filters": {}, "bars": 0}
 
-    # Compute indicators on full 1-min series (no NaN after bar 21)
-    df_1min["EMA_9"]  = ta.trend.ema_indicator(df_1min["close"], window=9)
-    df_1min["EMA_21"] = ta.trend.ema_indicator(df_1min["close"], window=21)
-    df_1min["RSI"]    = ta.momentum.rsi(df_1min["close"], window=14)
-    df_1min = df_1min.dropna(subset=["EMA_9", "EMA_21", "RSI"]).reset_index(drop=True)
-
-    if df_1min.empty:
-        return {"ok": False, "confirmed": False, "filters": {}, "bars": 0}
-
-    # Resample to 15M by taking every 15th row (end-of-bar snapshot)
-    # This gives the 15M EMA/RSI values that match what your chart shows
-    df_15m = df_1min.iloc[14::15].reset_index(drop=True)  # rows 14,29,44... = end of each 15-bar
-
+    df_15m = build_resampled_indicators(df_1min, 15)
     if df_15m.empty:
         return {"ok": False, "confirmed": False, "filters": {}, "bars": len(df_1min)}
 
@@ -887,7 +922,7 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
         "vwap": vwap_value,
         "pcr": oi.get("pcr", 0),
         "oi_available": oi.get("oi_available", False),
-        "bars": len(df_15m),
+        "bars": len(df_15m) if not df_15m.empty else 0,
     }
 
 
@@ -899,29 +934,14 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     ADX here confirms the 3M move has real momentum — not just a random wiggle.
     Uses STATE not crossover — avoids the timing coincidence problem entirely.
     """
-    # Same approach as 15M: compute on full 1min history, sample every 3rd row
-    # This gives 3M EMA/RSI that matches chart values exactly
-    df_1min_3m, ok_1min_3m = get_tf_data(token, "1minute", 20)
+    # Fetch 1min bars and resample to proper 3M OHLCV, then compute indicators
+    df_1min_3m, ok_1min_3m = get_tf_data(token, "1minute", 30)
     if not ok_1min_3m:
         return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
 
-    df_1min_3m["EMA_9"]   = ta.trend.ema_indicator(df_1min_3m["close"], window=9)
-    df_1min_3m["EMA_21"]  = ta.trend.ema_indicator(df_1min_3m["close"], window=21)
-    df_1min_3m["RSI"]     = ta.momentum.rsi(df_1min_3m["close"], window=14)
-    df_1min_3m["ADX"]     = ta.trend.adx(df_1min_3m["high"], df_1min_3m["low"],
-                                          df_1min_3m["close"], window=14)
-    # Volume SMA on 1min (20 bars = 20 minutes of volume context)
-    df_1min_3m["Vol_SMA"] = df_1min_3m["volume"].rolling(window=20).mean()
-    df_1min_3m = df_1min_3m.dropna().reset_index(drop=True)
-
-    if len(df_1min_3m) < 6:   # need at least 2 sampled 3M rows
-        return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
-
-    # Sample every 3rd row = end-of-3M-bar snapshot with correct indicator values
-    df = df_1min_3m.iloc[2::3].reset_index(drop=True)
-
+    df = build_resampled_indicators(df_1min_3m, 3)
     if len(df) < 2:
-        return {"ok": False, "triggered": False, "filters": {}, "df": df}
+        return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
