@@ -723,14 +723,14 @@ with col_ctrl:
         st.warning("Provide an Upstox Access Token to activate.")
     else:
         if not st.session_state.bot_active:
-            if st.button("▶️ START BOT", type="primary", use_container_width=True):
+            if st.button("▶️ START BOT", type="primary", width='stretch'):
                 st.session_state.bot_active          = True
                 st.session_state.loss_streak         = 0
                 st.session_state.pending_signal      = "none"
                 st.session_state.pending_signal_bars = 0
                 st.rerun()
         else:
-            if st.button("🛑 EMERGENCY HALT", type="secondary", use_container_width=True):
+            if st.button("🛑 EMERGENCY HALT", type="secondary", width='stretch'):
                 if st.session_state.current_position and not IS_PAPER:
                     pos     = st.session_state.current_position
                     ltp_now = fetch_ltp(ACCESS_TOKEN, pos["key"]) or pos["entry_price"]
@@ -746,13 +746,46 @@ with col_ctrl:
             csv_bytes = pd.DataFrame(st.session_state.trade_logs).to_csv(index=False).encode()
             st.download_button("📥 Trade Log (CSV)", data=csv_bytes,
                                file_name=f"scalper_{date.today()}.csv",
-                               mime="text/csv", use_container_width=True)
+                               mime="text/csv", width='stretch')
 
 with col_oi:
-    st.subheader("📊 OI Intelligence")
-    # Eagerly fetch OI for display even before first algo loop cycle
-    if ACCESS_TOKEN and not st.session_state.get("oi_snapshot") and nifty_spot:
-        fetch_option_chain_oi(ACCESS_TOKEN, nifty_spot)
+    st.subheader("\U0001f4ca OI Intelligence")
+
+    if ACCESS_TOKEN:
+        _spot_for_oi = nifty_spot if nifty_spot else 24000.0
+        _master   = st.session_state.get("instrument_master", pd.DataFrame())
+        _expiries = get_weekly_expiries(_master) if not _master.empty else []
+        if _expiries:
+            _expiry_str = _expiries[0].strftime("%Y-%m-%d")
+        else:
+            _today = date.today()
+            _dtt   = (3 - _today.weekday()) % 7
+            if _dtt == 0 and now_ist().hour >= 15:
+                _dtt = 7
+            _expiry_str = (_today + timedelta(days=_dtt)).strftime("%Y-%m-%d")
+
+        _oi_url = _build_url(
+            f"{UPSTOX_BASE_URL}/option/chain",
+            {"instrument_key": "NSE_INDEX|Nifty 50", "expiry_date": _expiry_str}
+        )
+
+        with st.expander("\U0001f50d OI Diagnostic", expanded=not bool(st.session_state.get("oi_snapshot"))):
+            st.caption(f"Spot ref: \u20b9{_spot_for_oi:,.0f} | Expiry: **{_expiry_str}**")
+            st.code(_oi_url, language="text")
+            if st.button("\U0001f504 Force Refresh OI", width='stretch'):
+                st.session_state.oi_snapshot = {}
+                st.session_state.oi_history  = []
+                st.rerun()
+            _errs = [e for e in st.session_state.get("api_errors", [])
+                     if "option" in e.get("endpoint", "")]
+            if _errs:
+                _e = _errs[-1]
+                st.error(f"Last error {_e['time']} \u2014 HTTP {_e['status']}: {_e['body']}")
+            else:
+                st.success("No OI API errors logged.")
+
+        if not st.session_state.get("oi_snapshot"):
+            fetch_option_chain_oi(ACCESS_TOKEN, _spot_for_oi)
 
     snap = st.session_state.get("oi_snapshot", {})
     if snap:
@@ -762,15 +795,15 @@ with col_oi:
         o1, o2   = st.columns(2)
         o1.metric("CE OI", f"{ce_oi/1e5:.2f}L")
         o2.metric("PE OI", f"{pe_oi/1e5:.2f}L")
-        pcr_icon = "🟢" if pcr > 1.2 else "🔴" if pcr < 0.8 else "🟡"
+        pcr_icon = "\U0001f7e2" if pcr > 1.2 else "\U0001f534" if pcr < 0.8 else "\U0001f7e1"
         st.metric("PCR", f"{pcr_icon} {pcr:.2f}",
                   help="PCR > 1.2 = bullish, < 0.8 = bearish")
         hist = st.session_state.get("oi_history", [])
         if len(hist) > 1:
             st.line_chart(pd.DataFrame(hist).tail(15)[["ce_oi", "pe_oi"]],
-                          height=120, use_container_width=True)
-    else:
-        st.info("OI loading… (requires valid token + market hours)")
+                          height=120, width='stretch')
+    elif ACCESS_TOKEN:
+        st.warning("\u26a0\ufe0f OI fetch returned no data \u2014 see diagnostic above.")
 
 with col_pos:
     st.subheader("📦 Active Position")
@@ -937,7 +970,7 @@ if st.session_state.trade_logs:
         return f"color: {color}; font-weight: bold"
 
     st.dataframe(df_logs.style.applymap(style_pnl, subset=["Net PnL ₹"]),
-                 use_container_width=True)
+                 width='stretch')
 
     total      = len(df_logs)
     wins       = (df_logs["Net PnL ₹"] > 0).sum()
@@ -962,15 +995,15 @@ if st.session_state.trade_logs:
 
     with st.expander("📈 Equity Curve"):
         df_logs["Cumulative PnL"] = df_logs["Net PnL ₹"].cumsum()
-        st.line_chart(df_logs["Cumulative PnL"], use_container_width=True)
+        st.line_chart(df_logs["Cumulative PnL"], width='stretch')
 else:
     st.info("No trades executed this session.")
 
 # ── Order log + API error log ─────────────────────────────────────────────────
 if st.session_state.order_log:
     with st.expander("🗂️ Raw Order Log"):
-        st.dataframe(pd.DataFrame(st.session_state.order_log), use_container_width=True)
+        st.dataframe(pd.DataFrame(st.session_state.order_log), width='stretch')
 
 if st.session_state.get("api_errors"):
     with st.expander(f"⚠️ API Error Log ({len(st.session_state.api_errors)} errors)"):
-        st.dataframe(pd.DataFrame(st.session_state.api_errors), use_container_width=True)
+        st.dataframe(pd.DataFrame(st.session_state.api_errors), width='stretch')
