@@ -696,8 +696,13 @@ def build_1h_trend(token: str) -> dict:
     Returns dict of filter states + direction (+1 bull, -1 bear, 0 neutral).
     """
     df, ok = get_tf_data(token, "60minute", 52)
+    # Store bar count for debug display in filter panel
+    st.session_state["_debug_1h_bars"] = list(range(len(df))) if not df.empty else []
     if not ok:
-        return {"ok": False, "direction": 0, "filters": {}}
+        return {
+            "ok": False, "direction": 0, "filters": {},
+            "debug": f"{len(df)} bars received (need 52)",
+        }
 
     df["EMA_20"] = ta.trend.ema_indicator(df["close"], window=20)
     df["EMA_50"] = ta.trend.ema_indicator(df["close"], window=50)
@@ -1135,7 +1140,28 @@ if ACCESS_TOKEN:
     st.markdown("---")
     st.subheader("📡 Multi-Timeframe Filter Status")
 
+    # ── Eagerly fetch 1H data for the panel even when bot is idle ─────────────
+    # The algo loop only runs when bot_active=True, but the panel should always
+    # show live data so you can see what the market is doing before starting.
+    if not st.session_state.bot_active:
+        _vwap_panel = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") or 0.0
+        _oi_panel   = st.session_state.get("oi_snapshot", {})
+        _oi_dict    = {
+            "oi_available": bool(_oi_panel),
+            "oi_surge_ce": False, "oi_surge_pe": False,
+            "pcr": (_oi_panel.get("pe_oi", 0) / _oi_panel.get("ce_oi", 1))
+                   if _oi_panel.get("ce_oi", 0) > 0 else 1.0,
+        }
+        _spot_panel = nifty_spot or 24000.0
+        _signal, _tf = evaluate_mtf_signal(ACCESS_TOKEN, _vwap_panel or _spot_panel, _oi_dict)
+        st.session_state.last_tf_data = _tf
+
     tf_data = st.session_state.get("last_tf_data", {})
+
+    # ── Manual refresh button ─────────────────────────────────────────────────
+    if st.button("🔄 Refresh MTF Status", key="mtf_refresh"):
+        st.session_state.last_tf_data = {}
+        st.rerun()
 
     col_1h, col_15m, col_3m = st.columns(3)
 
@@ -1160,7 +1186,19 @@ if ACCESS_TOKEN:
                 icon = "✅" if passed else "❌"
                 st.caption(f"{icon} {name}")
         else:
-            st.caption("⏳ Fetching 1H history (90-day endpoint)…")
+            # Show raw API error if any, so we can debug the endpoint
+            _h1_errs = [e for e in st.session_state.get("api_errors", [])
+                        if "historical-candle" in e.get("endpoint", "")]
+            if _h1_errs:
+                _e = _h1_errs[-1]
+                st.caption(f"❌ API error {_e['status']}: {_e['body'][:120]}")
+            else:
+                st.caption("⏳ Fetching 1H history (90-day endpoint)…")
+                _debug_msg = tf_data.get("1h", {}).get("debug", "")
+                bars_got   = len(st.session_state.get("_debug_1h_bars", []))
+                st.caption(f"📊 {bars_got} bars received / 52 needed")
+                if _debug_msg:
+                    st.caption(f"ℹ️ {_debug_msg}")
 
     with col_15m:
         m15 = tf_data.get("15m", {})
