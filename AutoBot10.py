@@ -1,2178 +1,1668 @@
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║       UPSTOX ALPHA TRADING ENGINE v2 — Live Options Matrix      ║
-║  Tabbed layout · Plotly charts · IV Percentile · P&L Heatmap   ║
-║  OI Change Tracking · PCR Trend · Interactive Strategy Builder  ║
-╚══════════════════════════════════════════════════════════════════╝
-"""
-
 import streamlit as st
-import numpy as np
-from scipy.stats import norm
-import requests
-import urllib.parse
-import json
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
 import time
-import colorsys
+import requests
+import pandas as pd
+import ta
+import json
+from datetime import date, datetime, timedelta, timezone
 
-# ═══════════════════════════════════════════════
-#  PAGE CONFIG
-# ═══════════════════════════════════════════════
+# ==============================================================================
+# CONFIGURATION CONSTANTS
+# ==============================================================================
+UPSTOX_BASE_URL       = "https://api.upstox.com/v2"
+NIFTY_LOT_SIZE        = 65
+MAX_LOSS_STREAK       = 2
+OI_SURGE_RATIO        = 1.5
+SLIPPAGE_PER_SIDE     = 1.5          # ₹ per unit per side
+IST                   = timezone(timedelta(hours=5, minutes=30))
+INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
-st.set_page_config(
-    page_title="Upstox Alpha Engine v2",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# ── Risk guardrail defaults ───────────────────────────────────────────────────
+DEFAULT_MAX_DAILY_LOSS = 5000
+DEFAULT_MAX_TRADES     = 5
+DEFAULT_STOP_LOSS_PCT  = 6
+DEFAULT_TARGET_PCT     = 12
+DEFAULT_RR_MIN         = 1.5
 
-# ═══════════════════════════════════════════════
-#  THEME CSS
-# ═══════════════════════════════════════════════
+# ── Prime trading windows in IST ──────────────────────────────────────────────
+PRIME_WINDOWS = [
+    ("09:30", "11:30"),
+    ("13:30", "14:45"),
+]
 
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
+# ==============================================================================
+# RATE-LIMIT AWARE HTTP CLIENT
+# ==============================================================================
+MAX_RETRIES    = 4
+BASE_BACKOFF_S = 1.0
+MIN_GAP_S      = 0.25
 
-:root {
-    --bg-primary: #0a0e1a;
-    --bg-card: #111827;
-    --bg-card-alt: #1a2236;
-    --border: #1e293b;
-    --text-primary: #f1f5f9;
-    --text-secondary: #94a3b8;
-    --accent-green: #22c55e;
-    --accent-red: #ef4444;
-    --accent-blue: #3b82f6;
-    --accent-purple: #8b5cf6;
-    --accent-amber: #f59e0b;
-}
-
-html, body, [data-testid="stAppViewContainer"] {
-    font-family: 'Inter', sans-serif !important;
-}
-
-/* Metric cards */
-div[data-testid="stMetric"] {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 12px 16px;
-    overflow: visible !important;
-}
-div[data-testid="stMetric"] label {
-    color: #cbd5e1 !important;
-    font-size: 10px !important;
-    letter-spacing: 1.2px;
-    text-transform: uppercase;
-    font-weight: 600 !important;
-}
-div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
-    font-family: 'JetBrains Mono', monospace !important;
-    font-weight: 800 !important;
-    font-size: 20px !important;
-    color: #ffffff !important;
-    white-space: nowrap !important;
-    overflow: visible !important;
-    text-overflow: unset !important;
-}
-div[data-testid="stMetric"] div[data-testid="stMetricDelta"] {
-    color: #94a3b8 !important;
-    font-weight: 600 !important;
-}
-div[data-testid="stMetric"] div[data-testid="stMetricDelta"] svg {
-    display: none;
-}
-
-/* Tabs */
-div[data-testid="stTabs"] button[data-baseweb="tab"] {
-    font-family: 'Inter', sans-serif !important;
-    font-weight: 600 !important;
-    font-size: 13px !important;
-    letter-spacing: 0.3px;
-}
-
-/* Sentiment card */
-.signal-card {
-    border-radius: 12px; padding: 20px; margin: 12px 0;
-    font-family: 'JetBrains Mono', monospace;
-    border: 1px solid rgba(255,255,255,0.08);
-}
-.signal-label { font-size: 10px; letter-spacing: 2.5px; color: rgba(255,255,255,0.7); margin-bottom: 2px; text-transform: uppercase; }
-.signal-value { font-size: 26px; font-weight: 700; color: #fff; }
-.signal-sub { font-size: 12px; color: rgba(255,255,255,0.75); margin-top: 6px; line-height: 1.6; }
-
-/* Strategy card */
-.strat-card {
-    background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
-    padding: 18px; margin: 10px 0; color: #ffffff;
-}
-.strat-title {
-    font-size: 14px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px;
-    margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border);
-}
-.strat-leg {
-    font-size: 14px; line-height: 2.0; font-family: 'JetBrains Mono', monospace;
-    color: #f1f5f9 !important; font-weight: 600;
-}
-.strat-leg b { color: #ffffff; font-weight: 800; }
-.strat-profit { font-size: 18px; font-weight: 800; margin-top: 12px; }
-
-/* Badge pills */
-.badge { display: inline-block; padding: 3px 10px; border-radius: 5px; font-size: 11px; font-weight: 600; font-family: 'JetBrains Mono', monospace; margin: 2px 3px; }
-.badge-green { background: rgba(34,197,94,0.15); color: #4ade80; border: 1px solid rgba(34,197,94,0.3); }
-.badge-red { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
-.badge-blue { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); }
-.badge-purple { background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3); }
-.badge-amber { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
-
-/* IV Gauge */
-.iv-gauge-container { display: flex; align-items: center; gap: 12px; margin: 6px 0; }
-.iv-gauge-bar { flex: 1; height: 10px; border-radius: 5px; background: linear-gradient(90deg, #22c55e 0%, #f59e0b 50%, #ef4444 100%); position: relative; }
-.iv-gauge-marker { position: absolute; top: -4px; width: 4px; height: 18px; background: #fff; border-radius: 2px; transform: translateX(-50%); box-shadow: 0 0 6px rgba(255,255,255,0.5); }
-.iv-pct-label { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; min-width: 60px; text-align: right; }
-
-footer { visibility: hidden; }
-</style>
-""", unsafe_allow_html=True)
-
-# ═══════════════════════════════════════════════
-#  CONSTANTS & INDEX DEFINITIONS
-# ═══════════════════════════════════════════════
-
-UPSTOX_BASE = "https://api.upstox.com/v2"
-
-INDICES = {
-    "NIFTY 50":     {"key": "NSE_INDEX|Nifty 50",          "symbol": "NIFTY",       "diff": 50,  "lot": 25},
-    "BANK NIFTY":   {"key": "NSE_INDEX|Nifty Bank",        "symbol": "BANKNIFTY",   "diff": 100, "lot": 15},
-    "FINNIFTY":     {"key": "NSE_INDEX|Nifty Fin Service",  "symbol": "FINNIFTY",    "diff": 50,  "lot": 25},
-    "MIDCAP NIFTY": {"key": "NSE_INDEX|NIFTY MID SELECT",  "symbol": "MIDCPNIFTY",  "diff": 25,  "lot": 50},
-}
-
-PLOTLY_LAYOUT = dict(
-    template="plotly_dark",
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(17,24,39,0.6)",
-    font=dict(family="Inter, sans-serif", size=11, color="#94a3b8"),
-    margin=dict(l=50, r=30, t=40, b=40),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
-    xaxis=dict(gridcolor="rgba(30,41,59,0.6)", zeroline=False),
-    yaxis=dict(gridcolor="rgba(30,41,59,0.6)", zeroline=False),
-)
-
-# ═══════════════════════════════════════════════
-#  UPSTOX API CLIENT
-# ═══════════════════════════════════════════════
-
-class UpstoxClient:
-    def __init__(self, token: str):
-        clean = token.strip().replace("Bearer ", "")
-        self.headers = {"Authorization": f"Bearer {clean}", "Accept": "application/json"}
-
-    def _safe_json(self, r):
-        ct = r.headers.get("Content-Type", "").lower()
-        if "application/json" not in ct:
-            raise ValueError(f"Non-JSON response (token expired?). Status {r.status_code}: {r.text[:200]}")
-        body = r.json()
-        if body.get("status") == "error":
-            errs = body.get("errors", [])
-            msg = errs[0].get("message", str(errs)) if errs else str(body)
-            raise ValueError(f"Upstox API: {msg}")
-        return body
-
-    def get_spot_price(self, instrument_key: str) -> float:
-        r = requests.get(f"{UPSTOX_BASE}/market-quote/ltp",
-                         headers=self.headers, params={"instrument_key": instrument_key}, timeout=10)
-        r.raise_for_status()
-        data = self._safe_json(r).get("data", {})
-        for k, v in data.items():
-            if k == instrument_key or k.lower().replace(" ", "") == instrument_key.lower().replace(" ", ""):
-                return float(v["last_price"])
-        first = next(iter(data.values()), None)
-        if first:
-            return float(first["last_price"])
-        raise ValueError(f"Symbol not found: {instrument_key}")
-
-    def get_expiries(self, instrument_key: str) -> list:
-        r = requests.get(f"{UPSTOX_BASE}/option/contract",
-                         headers=self.headers, params={"instrument_key": instrument_key}, timeout=10)
-        r.raise_for_status()
-        data = self._safe_json(r).get("data", [])
-        expiries = sorted(set(
-            str(c.get("expiry", ""))[:10] for c in data
-        ))
-        return [e for e in expiries if e and e != "None"]
-
-    def get_option_chain(self, instrument_key: str, expiry_date: str) -> list:
-        r = requests.get(f"{UPSTOX_BASE}/option/chain",
-                         headers=self.headers,
-                         params={"instrument_key": instrument_key, "expiry_date": expiry_date}, timeout=10)
-        r.raise_for_status()
-        return self._safe_json(r).get("data", [])
-
-    def get_option_contracts(self, instrument_key: str, expiry_date: str) -> list:
-        """
-        Fetch ALL option contracts for an instrument+expiry via /option/contract.
-        Returns list of contract dicts with instrument_key, strike_price, option_type etc.
-        This gives the FULL strike range, unlike /option/chain which is limited.
-        """
-        r = requests.get(f"{UPSTOX_BASE}/option/contract",
-                         headers=self.headers,
-                         params={"instrument_key": instrument_key}, timeout=10)
-        r.raise_for_status()
-        all_contracts = self._safe_json(r).get("data", [])
-        # Filter to the target expiry
-        matched = []
-        for c in all_contracts:
-            exp = str(c.get("expiry", ""))[:10]
-            if exp == expiry_date:
-                matched.append(c)
-        return matched
-
-    def get_ltp_batch(self, instrument_keys: list) -> dict:
-        """
-        Fetch LTP for up to 50 instruments in one call via /market-quote/ltp.
-        Returns {instrument_key: ltp} dict.
-        """
-        result = {}
-        # API allows comma-separated keys, max ~50 per call
-        for i in range(0, len(instrument_keys), 50):
-            batch = instrument_keys[i:i+50]
-            keys_param = ",".join(batch)
-            r = requests.get(f"{UPSTOX_BASE}/market-quote/ltp",
-                             headers=self.headers,
-                             params={"instrument_key": keys_param}, timeout=10)
-            r.raise_for_status()
-            data = self._safe_json(r).get("data", {})
-            for k, v in data.items():
-                result[k] = float(v.get("last_price", 0) or 0)
-        return result
-
-    def get_historical_candles(self, instrument_key: str, interval="day", days=45) -> pd.DataFrame:
-        to_d = datetime.now().strftime("%Y-%m-%d")
-        from_d = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        enc = urllib.parse.quote(instrument_key, safe="")
-        r = requests.get(f"{UPSTOX_BASE}/historical-candle/{enc}/{interval}/{to_d}/{from_d}",
-                         headers=self.headers, timeout=10)
-        r.raise_for_status()
-        candles = self._safe_json(r).get("data", {}).get("candles", [])
-        if not candles:
-            return pd.DataFrame()
-        rows = [{"ts": c[0], "open": float(c[1]), "high": float(c[2]),
-                 "low": float(c[3]), "close": float(c[4]),
-                 "volume": int(c[5]) if len(c) > 5 else 0} for c in candles if len(c) >= 5]
-        return pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
+if "api_last_call" not in st.session_state:
+    st.session_state.api_last_call = {}
 
 
-# ═══════════════════════════════════════════════
-#  ANALYTICS FUNCTIONS
-# ═══════════════════════════════════════════════
+# ==============================================================================
+# ── KEY FIX: RAW URL BUILDER ─────────────────────────────────────────────────
+# requests.get(params=...) URL-encodes query strings, turning
+# "NSE_INDEX|Nifty 50" → "NSE_INDEX%7CNifty%2050".
+# Upstox validates the raw string server-side and rejects the encoded form
+# with error UDAPI100011 "Invalid Instrument".
+# _build_url() builds the query string manually so | and spaces are sent raw.
+# ==============================================================================
 
-def compute_adx(df: pd.DataFrame, period=14):
-    if df.empty or len(df) < period * 2 + 2:
-        return None
-    d = df.copy()
-    d["ph"], d["pl"], d["pc"] = d["high"].shift(1), d["low"].shift(1), d["close"].shift(1)
-    d["tr"] = d.apply(lambda r: max(r["high"]-r["low"],
-        abs(r["high"]-r["pc"]) if pd.notna(r["pc"]) else 0,
-        abs(r["low"]-r["pc"]) if pd.notna(r["pc"]) else 0), axis=1)
-    d["+dm"] = d.apply(lambda r: max(r["high"]-r["ph"],0)
-        if pd.notna(r["ph"]) and (r["high"]-r["ph"])>(r["pl"]-r["low"]) else 0, axis=1)
-    d["-dm"] = d.apply(lambda r: max(r["pl"]-r["low"],0)
-        if pd.notna(r["pl"]) and (r["pl"]-r["low"])>(r["high"]-r["ph"]) else 0, axis=1)
-    d = d.iloc[1:].reset_index(drop=True)
-    tr_s = [d["tr"].iloc[:period].sum()]
-    pd_s = [d["+dm"].iloc[:period].sum()]
-    nd_s = [d["-dm"].iloc[:period].sum()]
-    for i in range(period, len(d)):
-        tr_s.append(tr_s[-1] - tr_s[-1]/period + d["tr"].iloc[i])
-        pd_s.append(pd_s[-1] - pd_s[-1]/period + d["+dm"].iloc[i])
-        nd_s.append(nd_s[-1] - nd_s[-1]/period + d["-dm"].iloc[i])
-    pdi_l, ndi_l, dx_l = [], [], []
-    for i in range(len(tr_s)):
-        pdi = pd_s[i]/tr_s[i]*100 if tr_s[i]>0 else 0
-        ndi = nd_s[i]/tr_s[i]*100 if tr_s[i]>0 else 0
-        pdi_l.append(pdi); ndi_l.append(ndi)
-        dx_l.append(abs(pdi-ndi)/(pdi+ndi)*100 if (pdi+ndi)>0 else 0)
-    if len(dx_l) < period:
-        return None
-    adx_l = [sum(dx_l[:period])/period]
-    for i in range(period, len(dx_l)):
-        adx_l.append((adx_l[-1]*(period-1)+dx_l[i])/period)
-    return {"adx": round(adx_l[-1],2), "plus_di": round(pdi_l[-1],2), "minus_di": round(ndi_l[-1],2)}
+def _build_url(base: str, params: dict) -> str:
+    """Builds URL with raw (un-encoded) query params — required by Upstox."""
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    return f"{base}?{qs}"
 
 
-def bs_greeks(S, K, T, r, sigma, opt="CE"):
-    if T <= 0 or sigma <= 0:
-        return {"price":0,"delta":0,"gamma":0,"theta":0,"vega":0}
-    d1 = (np.log(S/K)+(r+0.5*sigma**2)*T)/(sigma*np.sqrt(T))
-    d2 = d1 - sigma*np.sqrt(T)
-    gamma = norm.pdf(d1)/(S*sigma*np.sqrt(T))
-    vega = S*norm.pdf(d1)*np.sqrt(T)/100
-    if opt == "CE":
-        price = S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
-        delta = norm.cdf(d1)
-        theta = (-(S*norm.pdf(d1)*sigma)/(2*np.sqrt(T)) - r*K*np.exp(-r*T)*norm.cdf(d2))/365
-    else:
-        price = K*np.exp(-r*T)*norm.cdf(-d2) - S*norm.cdf(-d1)
-        delta = norm.cdf(d1)-1
-        theta = (-(S*norm.pdf(d1)*sigma)/(2*np.sqrt(T)) + r*K*np.exp(-r*T)*norm.cdf(-d2))/365
-    return {"price":round(price,2),"delta":round(delta,3),"gamma":round(gamma,5),"theta":round(theta,2),"vega":round(vega,2)}
+def _auth_headers(token: str) -> dict:
+    return {"Accept": "application/json", "Authorization": f"Bearer {token}"}
 
 
-def implied_vol(market_price, S, K, T, r, opt="CE", max_iter=50, tol=1e-5):
+def _raw_get(token: str, url: str, timeout: int = 8) -> dict | None:
     """
-    Compute implied volatility from a market price using Newton-Raphson.
-    Returns IV as a decimal (e.g. 0.15 for 15%), or None if it can't converge.
+    GET using a pre-built raw URL (no params= encoding).
+    Handles 429 / 5xx with exponential backoff, logs 4xx errors.
     """
-    if market_price <= 0 or T <= 0 or S <= 0 or K <= 0:
-        return None
+    path  = url.split("?")[0].split("api.upstox.com")[-1]
+    gap   = time.time() - st.session_state.api_last_call.get(path, 0)
+    if gap < MIN_GAP_S:
+        time.sleep(MIN_GAP_S - gap)
 
-    # Intrinsic value check — price must exceed intrinsic
-    if opt == "CE":
-        intrinsic = max(0, S - K * np.exp(-r * T))
-    else:
-        intrinsic = max(0, K * np.exp(-r * T) - S)
-
-    if market_price < intrinsic * 0.95:
-        return None  # Price below intrinsic — bad data
-
-    # Initial guess from Brenner-Subrahmanyam approximation
-    sigma = np.sqrt(2 * np.pi / T) * (market_price / S)
-    sigma = max(0.01, min(sigma, 5.0))  # Clamp to sane range
-
-    for _ in range(max_iter):
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
-
-        if opt == "CE":
-            bs_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-        else:
-            bs_price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-
-        vega = S * norm.pdf(d1) * np.sqrt(T)  # NOT divided by 100 here
-
-        diff = bs_price - market_price
-
-        if abs(diff) < tol:
-            if 0.01 <= sigma <= 3.0:
-                return sigma
+    delay = BASE_BACKOFF_S
+    for attempt in range(MAX_RETRIES):
+        try:
+            st.session_state.api_last_call[path] = time.time()
+            res = requests.get(url, headers=_auth_headers(token), timeout=timeout)
+            if res.status_code == 200:
+                return res.json()
+            if res.status_code == 429:
+                time.sleep(float(res.headers.get("Retry-After", delay)))
+                delay *= 2
+                continue
+            if res.status_code >= 500:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            # 4xx — log and return None
+            st.session_state.setdefault("api_errors", []).append({
+                "time": now_ist().strftime("%H:%M:%S"),
+                "endpoint": path,
+                "status": res.status_code,
+                "body": res.text[:300],
+            })
             return None
-
-        if vega < 1e-10:
-            break  # Vega too small to move sigma meaningfully
-
-        sigma -= diff / vega
-        sigma = max(0.005, min(sigma, 5.0))  # Keep bounded
-
-    return None  # Didn't converge
-
-
-def compute_max_pain(df_chain: pd.DataFrame) -> float:
-    strikes = df_chain["Strike"].astype(float).values
-    ce_oi = df_chain["CE OI"].astype(float).values
-    pe_oi = df_chain["PE OI"].astype(float).values
-    pain = {}
-    for s in strikes:
-        total = 0.0
-        for k in range(len(strikes)):
-            total += max(0.0, s - strikes[k]) * pe_oi[k]
-            total += max(0.0, strikes[k] - s) * ce_oi[k]
-        pain[s] = total
-    return min(pain, key=pain.get) if pain else 0.0
+        except requests.exceptions.Timeout:
+            time.sleep(delay)
+            delay *= 2
+        except Exception as e:
+            st.session_state.setdefault("api_errors", []).append({
+                "time": now_ist().strftime("%H:%M:%S"),
+                "endpoint": path,
+                "status": "exception",
+                "body": str(e),
+            })
+            return None
+    return None
 
 
-def compute_iv_percentile(candles_df: pd.DataFrame, current_iv: float, window=30) -> float:
-    """IV Percentile: % of last N days where realized vol was below current IV."""
-    if candles_df.empty or len(candles_df) < window + 2:
-        return 50.0  # default mid
-    closes = candles_df["close"].values
-    log_ret = np.diff(np.log(closes))
-    if len(log_ret) < window:
-        return 50.0
-    # Rolling realized vol (annualised)
-    rv_series = []
-    for i in range(len(log_ret) - window + 1):
-        chunk = log_ret[i:i+window]
-        rv = np.std(chunk) * np.sqrt(252) * 100
-        rv_series.append(rv)
-    if not rv_series:
-        return 50.0
-    count_below = sum(1 for rv in rv_series if rv < current_iv * 100)
-    return round(count_below / len(rv_series) * 100, 1)
-
-
-def compute_pnl_heatmap(strategy_legs, lot_size, spot_price, diff, iv_used, rfr):
+def api_get(token: str, url: str, params: dict | None = None, timeout: int = 8) -> dict | None:
     """
-    Compute strategy P&L across a grid of spot prices and days-to-expiry.
-    Each leg: {"strike": K, "type": "CE"/"PE", "action": "BUY"/"SELL", "premium": ltp}
-    Uses fewer spot steps for readability (strike-aligned grid).
+    Wrapper for endpoints that do NOT contain special chars in params.
+    For instrument_key params use _raw_get(_build_url(...)) instead.
     """
-    # Create a strike-aligned grid: every 'diff' points, ±6 strikes from ATM
-    atm = round(spot_price / diff) * diff
-    spot_range = np.arange(atm - 6*diff, atm + 6*diff + 1, diff)
-    dte_range = np.array([0, 1, 2, 3, 5, 7, 10, 14])
-
-    pnl_matrix = np.zeros((len(dte_range), len(spot_range)))
-
-    for i, dte in enumerate(dte_range):
-        for j, s in enumerate(spot_range):
-            total = 0.0
-            for leg in strategy_legs:
-                K = leg["strike"]
-                prem = leg["premium"]
-                if dte == 0:
-                    if leg["type"] == "CE":
-                        val = max(0, s - K)
-                    else:
-                        val = max(0, K - s)
-                else:
-                    T = dte / 365
-                    sigma = iv_used if iv_used > 0 else 0.15
-                    val = bs_greeks(s, K, T, rfr, sigma, leg["type"])["price"]
-
-                if leg["action"] == "BUY":
-                    total += (val - prem)
-                else:
-                    total += (prem - val)
-            pnl_matrix[i, j] = total * lot_size
-    return spot_range, dte_range, pnl_matrix
+    if params:
+        built = _build_url(url, params)
+        return _raw_get(token, built, timeout)
+    return _raw_get(token, url, timeout)
 
 
-# ═══════════════════════════════════════════════
-#  SIDEBAR
-# ═══════════════════════════════════════════════
+# ==============================================================================
+# IST TIME HELPERS
+# ── Streamlit Cloud runs UTC. All time comparisons use explicit IST offset.
+# ==============================================================================
 
-st.sidebar.markdown("### 🔐 Authentication")
-api_token = st.sidebar.text_input("Access Token", type="password", value="",
-                                   help="Paste your Upstox OAuth access_token. Expires midnight IST daily.")
+def now_ist() -> datetime:
+    return datetime.now(tz=IST)
 
-st.sidebar.markdown("---")
-selected_index_name = st.sidebar.selectbox("🎯 Underlying Index", list(INDICES.keys()))
-index_meta = INDICES[selected_index_name]
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### ⚙️ Engine Parameters")
-iv_override = st.sidebar.slider("IV Fallback (used when live IV unavailable) %", 5.0, 80.0, 15.0, 0.5) / 100
-strike_depth = st.sidebar.slider("Strike Depth Around ATM", 3, 15, 7)
+def in_prime_session() -> bool:
+    now = now_ist().time()
+    for start_str, end_str in PRIME_WINDOWS:
+        start = datetime.strptime(start_str, "%H:%M").time()
+        end   = datetime.strptime(end_str,   "%H:%M").time()
+        if start <= now <= end:
+            return True
+    return False
 
-# ── Risk-Free Rate: fetch live India 10Y G-Sec yield ──
-def fetch_risk_free_rate():
+
+def next_window_str() -> str:
+    now = now_ist().time()
+    for start_str, end_str in PRIME_WINDOWS:
+        start = datetime.strptime(start_str, "%H:%M").time()
+        if now < start:
+            return f"{start_str} – {end_str} IST"
+    return "09:30 IST tomorrow"
+
+
+def ist_time_str() -> str:
+    return now_ist().strftime("%H:%M:%S IST")
+
+
+def get_active_expiry_str(master: pd.DataFrame | None = None) -> str:
     """
-    Fetch India 10Y government bond yield as risk-free rate proxy.
-    Uses RBI/market data. Falls back to 7.0% if unavailable.
+    Returns the correct weekly Nifty expiry date (YYYY-MM-DD) in IST.
+
+    Rules:
+      - Non-Tuesday: nearest upcoming Tuesday
+      - Tuesday before 15:25 IST: TODAY (contracts still live)
+      - Tuesday after  15:25 IST: next Tuesday (roll over after settlement)
+
+    If an instrument master is provided and has upcoming expiries,
+    the first valid date from the master is used instead of the formula
+    — this handles exchange holiday rollovers automatically.
     """
+    now       = now_ist()
+    today_ist = now.date()
+    cutoff    = now.replace(hour=15, minute=25, second=0, microsecond=0)
+
+    # ── Master-based resolution (most accurate) ───────────────────────────────
+    if master is not None and not master.empty:
+        expiries = get_weekly_expiries(master)   # already filtered to >= today IST
+        if expiries:
+            nearest = expiries[0]
+            # If nearest expiry is today AND we are past cutoff → use next one
+            if nearest == today_ist and now >= cutoff and len(expiries) > 1:
+                return expiries[1].strftime("%Y-%m-%d")
+            return nearest.strftime("%Y-%m-%d")
+
+    # ── Formula fallback ──────────────────────────────────────────────────────
+    days_to_expiry = (1 - today_ist.weekday()) % 7  # 0 when today is Tuesday (expiry day)
+
+    if days_to_expiry == 0:
+        # Today is expiry day
+        if now >= cutoff:
+            days_to_expiry = 7   # roll to next week after 15:25
+        # else: stay at 0 — use today's expiry
+
+    expiry = today_ist + timedelta(days=days_to_expiry)
+    return expiry.strftime("%Y-%m-%d")
+
+
+def fetch_valid_expiries(token: str) -> list[str]:
+    """
+    Fetches real available expiry dates directly from Upstox
+    /v2/option/contract endpoint. Returns a sorted list of
+    YYYY-MM-DD strings >= today IST. Falls back to formula if API fails.
+    This is the only reliable way to know which expiries Upstox has live data for.
+    """
+    cached = st.session_state.get("valid_expiries", [])
+    if cached:
+        return cached
+
+    url  = _build_url(
+        f"{UPSTOX_BASE_URL}/option/contract",
+        {"instrument_key": "NSE_INDEX|Nifty 50"}
+    )
+    data = _raw_get(token, url)
+    if data is None:
+        return []
+
     try:
-        # Try fetching from a public API
-        r = requests.get(
-            "https://api.worldbank.org/v2/country/IND/indicator/FR.INR.RINR?date=2024:2026&format=json",
-            timeout=5
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if len(data) > 1 and data[1]:
-                for entry in data[1]:
-                    if entry.get("value") is not None:
-                        return round(float(entry["value"]), 2)
+        contracts  = data.get("data", [])
+        today_ist  = now_ist().date()
+        expiry_set = set()
+        for c in contracts:
+            exp_str = c.get("expiry", "")
+            if exp_str:
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                    if exp_date >= today_ist:
+                        expiry_set.add(exp_str)
+                except ValueError:
+                    continue
+        sorted_expiries = sorted(expiry_set)
+        st.session_state["valid_expiries"] = sorted_expiries
+        return sorted_expiries
     except Exception:
-        pass
-
-    # Fallback: use India 91-day T-bill rate approximation
-    # As of mid-2025, India 10Y is ~7.0-7.1%
-    return 7.0
-
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def get_cached_rfr():
-    return fetch_risk_free_rate()
-
-live_rfr = get_cached_rfr()
-rfr_is_live = live_rfr != 7.0
-
-risk_free_rate = st.sidebar.number_input(
-    f"Risk-Free Rate % {'(live)' if rfr_is_live else '(default)'}",
-    min_value=0.0, max_value=15.0, value=float(live_rfr), step=0.1,
-    help="India 10Y G-Sec yield. Auto-fetched; editable if you want to override."
-) / 100
-
-st.sidebar.markdown("---")
-auto_refresh = st.sidebar.checkbox("🔄 Auto-Refresh", value=False)
-refresh_interval = 30
-if auto_refresh:
-    refresh_interval = st.sidebar.slider("Interval (sec)", 10, 120, 30, 5)
-
-# ═══════════════════════════════════════════════
-#  HEADER
-# ═══════════════════════════════════════════════
-
-st.markdown(f"""
-<div style="display:flex; align-items:center; gap:12px; margin-bottom:4px;">
-    <span style="font-size:28px;">⚡</span>
-    <span style="font-family:'Inter',sans-serif; font-size:22px; font-weight:700;">
-        Upstox Alpha Engine
-    </span>
-    <span style="font-size:12px; color:#64748b; background:rgba(59,130,246,0.12); padding:2px 8px;
-                 border-radius:4px; font-weight:600; margin-left:4px;">v2.0</span>
-    <span style="font-size:13px; color:#94a3b8; margin-left:auto; font-family:'JetBrains Mono',monospace;">
-        {selected_index_name}
-    </span>
-</div>
-""", unsafe_allow_html=True)
-
-# ── Help Guide ──
-HELP_CONTENT = """
-## 📖 Upstox Alpha Engine — User Guide
-
----
-
-### 🔐 Getting Started
-
-**Step 1: Get Your Access Token**
-1. Log in to [Upstox Developer Console](https://api.upstox.com)
-2. Complete the OAuth2 authentication flow
-3. Copy the `access_token` from the redirect URL
-4. Paste it in the sidebar under **Access Token**
-
-> ⚠️ Tokens expire at **midnight IST daily**. You'll need a fresh one each trading day.
-
-**Step 2: Select Your Index**
-Choose from NIFTY 50, BANK NIFTY, FINNIFTY, or MIDCAP NIFTY in the sidebar.
-
-**Step 3: Pick an Expiry**
-The nearest expiry is auto-selected. Switch to weekly/monthly as needed.
-
----
-
-### 📊 Top KPI Row — What Each Metric Means
-
-| Metric | What It Tells You |
-|--------|-------------------|
-| **Spot** | Current index price from Upstox. This is where the market is right now. |
-| **ATM** | At-The-Money strike — the option strike closest to spot. This is your anchor point. |
-| **PCR** | Put-Call Ratio (by OI). **> 1.0** = more puts written = bullish bias. **< 1.0** = more calls written = bearish bias. |
-| **Max Pain** | The strike where option sellers lose the least money. Markets tend to gravitate here by expiry. |
-| **VWAS** | Volume-Weighted Average Strike — where actual trading volume concentrates. If VWAS > Spot, money is flowing to higher strikes (bullish). |
-| **ADX (14)** | Trend strength (not direction). **< 20** = no trend, range-bound. **20-25** = trend emerging. **> 25** = strong trend. |
-| **DTE** | Days to expiry. Theta decay accelerates sharply below 5 DTE. |
-
----
-
-### 🎯 IV Percentile Gauge
-
-The horizontal bar shows where current implied volatility sits relative to its recent history.
-
-- **Green zone (0-30%)**: IV is LOW → options are cheap → favor buying strategies (long straddle, debit spreads)
-- **Amber zone (30-70%)**: IV is normal → no strong edge either way
-- **Red zone (70-100%)**: IV is HIGH → options are expensive → favor selling strategies (iron condor, short straddle)
-
-**LIVE** badge = IV computed from actual market prices via Newton-Raphson solver.
-**MANUAL** badge = using the sidebar slider (market closed or no data).
-
----
-
-### 🟢🔴 Sentiment Card
-
-Combines PCR analysis with OI distribution:
-
-| Signal | PCR Range | Meaning |
-|--------|-----------|---------|
-| **STRONG BULLISH** | ≥ 1.25 | Heavy put writing = writers believe market won't fall. Strong support below. |
-| **MILDLY BULLISH** | 1.05 – 1.25 | Slight bullish tilt. |
-| **NEUTRAL** | 0.95 – 1.05 | No clear directional bias. |
-| **MILDLY BEARISH** | 0.75 – 0.95 | Slight bearish tilt. |
-| **STRONG BEARISH** | ≤ 0.75 | Heavy call writing = writers believe market won't rise. Resistance above. |
-
-**Support** = strike with highest Put OI (floor the market respects).
-**Resistance** = strike with highest Call OI (ceiling the market faces).
-
----
-
-### 📊 Dashboard Tab
-
-**Statistical Price Forecast (Bell Curve)**
-Uses the normal distribution to predict where the index will settle by expiry.
-- **1σ zone (68.2%)**: The index has a 68% chance of staying within this range.
-- **2σ zone (95.4%)**: 95% probability zone.
-- Vertical lines mark current spot, max pain, support, and resistance.
-
-**PCR Trend**: If auto-refresh is on, tracks how PCR shifts during the session. A rising PCR = growing bullish sentiment.
-
-**OI Change Tables**: Shows which strikes saw the most new position build-up today.
-- Fresh Call OI build-up at higher strikes = resistance strengthening = bearish.
-- Fresh Put OI build-up at lower strikes = support strengthening = bullish.
-
----
-
-### 📋 Options Chain Tab
-
-The full chain with live Greeks, OI, volume, and IV per strike.
-
-**How to read it:**
-- **Yellow row** = ATM strike
-- **Green tint** = in-the-money calls (below spot)
-- **Red tint** = in-the-money puts (above spot)
-- **Blue intensity on OI** = brighter = higher OI = stronger support/resistance at that strike
-- **Green OI Change** = new positions being built (bullish for puts, bearish for calls)
-- **Red OI Change** = positions being unwound
-
-**Key Greeks:**
-- **Delta**: How much the option moves per ₹1 move in spot. ATM ≈ 0.5.
-- **Theta**: How much you lose per day from time decay. Higher near expiry.
-- **Gamma**: How fast delta changes. Highest at ATM, near expiry.
-- **Vega**: Sensitivity to IV changes. Higher for longer-dated options.
-
----
-
-### 🛡️ Strategy Builder Tab
-
-**Engine Recommendation**: Auto-suggests a strategy based on:
-- **ADX > 25** → Trending market → use directional strategies (debit spreads)
-- **IV Pct > 70%** → Expensive options → sell premium (iron butterfly, short straddle)
-- **IV Pct < 30%** → Cheap options → buy premium (long straddle)
-- **Otherwise** → Range-bound → iron condor
-
-**Available Strategies:**
-
-| Strategy | When to Use | Risk Profile |
-|----------|-------------|--------------|
-| **Iron Condor** | Range-bound, moderate IV | Defined risk, defined reward. Profits if index stays between sell strikes. |
-| **Short Straddle** | Expecting minimal movement, high IV | Unlimited risk! Maximum premium collection but dangerous if market moves big. |
-| **Iron Butterfly** | Expecting pinning at ATM, high IV | Defined risk. Like a tighter iron condor centered at ATM. |
-| **Bull Put Spread** | Mildly bullish | Defined risk. Profits if index stays above sell strike. |
-| **Bear Call Spread** | Mildly bearish | Defined risk. Profits if index stays below sell strike. |
-
-**P&L Heatmap**: Each cell shows your exact ₹ profit or loss based on:
-- **Columns** = where the index might be at various levels
-- **Rows** = how many days remain until expiry
-- **Green cells** = you make money. **Red cells** = you lose money.
-- The **"You Are Here"** marker shows where spot currently sits.
-
-**Payoff at Expiry**: The classic hockey-stick diagram showing your final P&L.
-- **Green zone** = profit area. **Red zone** = loss area.
-- Annotated arrows point to max profit and max loss levels.
-
-**Summary Box**: Quick-glance numbers — what you collect, best/worst case, risk:reward ratio.
-
----
-
-### 📈 Charts Tab
-
-**OI Distribution**: Bar chart of Call vs Put open interest per strike.
-- Tallest Call OI bar = strongest resistance.
-- Tallest Put OI bar = strongest support.
-- Max Pain marker shows the "magnet" strike.
-
-**OI Change**: Shows where NEW positions were opened today.
-- Positive bars = build-up (new positions). Negative = unwinding.
-- Interpreting: Call build-up at higher strikes = bearish. Put build-up at lower strikes = bullish.
-
-**Delta Skew**: Shows how delta varies across strikes.
-- Steep skew = market pricing in directional risk.
-- Flat = neutral expectations.
-
-**IV Smile**: Implied volatility across strikes.
-- U-shape ("smile") = normal. Skewed = market expects movement in one direction.
-- Higher IV at OTM puts = market pricing in downside risk (fear).
-
-**Cumulative OI**: Running total of Call vs Put OI from lowest to highest strike.
-- Where Put cumulative OI exceeds Call = bullish zone.
-- Where Call exceeds Put = bearish zone.
-
----
-
-### ⚙️ Engine Parameters
-
-| Parameter | What It Controls |
-|-----------|-----------------|
-| **IV Fallback** | Only used when live IV can't be computed (market closed). During market hours, all IV is live. |
-| **Risk-Free Rate** | Auto-fetched from World Bank (India rate). Editable. Feeds into all Black-Scholes calculations. |
-| **Strike Depth** | How many strikes above/below ATM to show in the chain. Higher = more strikes but slower load. |
-| **Auto-Refresh** | When enabled, the entire dashboard reloads every N seconds with fresh data. |
-
----
-
-### 💡 Pro Tips
-
-1. **Best used during market hours** (9:15 AM – 3:30 PM IST). After hours, LTPs freeze and some features show theoretical values.
-2. **Watch PCR + OI Change together**: A rising PCR with heavy put OI build-up at support = very bullish setup.
-3. **Max Pain is a magnet, not a guarantee**: It works best 2-3 days before expiry.
-4. **IV Percentile > 70% on expiry week** = premium selling sweet spot. Time decay is on your side.
-5. **ADX below 20 + high IV** = the ideal iron condor/butterfly setup. No trend + expensive options = sell premium.
-6. **VWAS diverging from spot** = smart money positioning differently from current price. Follow VWAS for directional hints.
-
----
-
-*Built for Indian equity derivatives on NSE. Data from Upstox V2 API. Greeks via Black-Scholes. IV via Newton-Raphson.*
-"""
-
-# Help button in sidebar — uses expander, no session state, no pop-up on refresh
-st.sidebar.markdown("---")
-with st.sidebar.expander("📖 Help & User Guide"):
-    st.markdown(HELP_CONTENT)
-
-# ═══════════════════════════════════════════════
-#  MAIN ENGINE
-# ═══════════════════════════════════════════════
-
-if not api_token:
-    st.info("💡 Enter your **Upstox Access Token** in the sidebar to begin. "
-            "Get it via the Upstox OAuth2 flow — it resets at midnight IST.")
-    st.stop()
-
-try:
-    client = UpstoxClient(token=api_token)
-    diff = index_meta["diff"]
-    lot_size = index_meta["lot"]
-
-    spot_price = client.get_spot_price(index_meta["key"])
-    expiries = client.get_expiries(index_meta["key"])
+        return []
+
+
+def get_active_expiry_from_upstox(token: str) -> str:
+    """
+    Gets the correct active expiry date from Upstox directly.
+    On expiry day before 15:25 IST  → returns today's expiry.
+    On expiry day after  15:25 IST  → returns next available expiry.
+    All other days                  → returns nearest upcoming expiry.
+    Falls back to get_active_expiry_str() formula if API unavailable.
+    """
+    expiries = fetch_valid_expiries(token)
 
     if not expiries:
-        st.error("No active derivative contracts found.")
-        st.stop()
+        # API unavailable — use formula fallback
+        master = st.session_state.get("instrument_master", pd.DataFrame())
+        return get_active_expiry_str(master)
 
-    selected_expiry = st.sidebar.selectbox("📅 Expiry", expiries, index=0)
+    now       = now_ist()
+    today_str = now_ist().date().strftime("%Y-%m-%d")
+    cutoff    = now.replace(hour=15, minute=25, second=0, microsecond=0)
 
-    expiry_dt = datetime.strptime(selected_expiry, "%Y-%m-%d").replace(hour=15, minute=30)
-    tte_years = max((expiry_dt - datetime.now()).total_seconds() / (86400*365), 0.0001)
-    tte_days = max(tte_years * 365, 0.01)
+    # If today is in the list and we're before cutoff — use today
+    if today_str in expiries and now < cutoff:
+        return today_str
 
-    with st.spinner("Loading chain, contracts & candles..."):
-        candles_df = client.get_historical_candles(index_meta["key"], "day", 60)
-        adx_metrics = compute_adx(candles_df)
-        chain_raw = client.get_option_chain(index_meta["key"], selected_expiry)
-        # Fetch ALL contracts for this expiry — gives full strike range with instrument keys
-        all_contracts = client.get_option_contracts(index_meta["key"], selected_expiry)
+    # Otherwise use the first future expiry (skips today if past cutoff)
+    for exp in expiries:
+        if exp > today_str:
+            return exp
+        if exp == today_str and now < cutoff:
+            return exp
 
-    if not chain_raw and not all_contracts:
-        st.warning("Empty chain for this expiry.")
-        st.stop()
+    # All expiries are in the past — formula fallback
+    master = st.session_state.get("instrument_master", pd.DataFrame())
+    return get_active_expiry_str(master)
 
-    atm_strike = round(spot_price / diff) * diff
 
-    # ── Build COMPLETE instrument key map from /option/contract ──
-    # This covers ALL strikes for the expiry, not just the limited /option/chain window
-    strike_inst_map = {}  # (strike, "CE"/"PE") -> instrument_key
-    for c in all_contracts:
-        sp = float(c.get("strike_price", 0))
-        opt_type = str(c.get("option_type", "")).upper()
-        inst_key = c.get("instrument_key", "")
-        if inst_key and opt_type in ("CE", "PE"):
-            strike_inst_map[(sp, opt_type)] = inst_key
 
-    # Also populate from chain_raw in case /option/contract used different field names
-    for sd in chain_raw:
-        sp = float(sd.get("strike_price", 0))
-        for side, label in [("call_options", "CE"), ("put_options", "PE")]:
-            opt = sd.get(side, {}) or {}
-            ik = opt.get("instrument_key", "")
-            if ik and (sp, label) not in strike_inst_map:
-                strike_inst_map[(sp, label)] = ik
+# ==============================================================================
+# INSTRUMENT MASTER
+# ==============================================================================
 
-    # ── Determine which strikes we need LTPs for ──
-    # Display range + strategy strikes
-    display_strikes = set()
-    for sd in chain_raw:
-        sp = float(sd.get("strike_price", 0))
-        if abs(sp - atm_strike) <= strike_depth * diff:
-            display_strikes.add(sp)
+def load_instrument_master() -> pd.DataFrame:
+    if "instrument_master" in st.session_state:
+        return st.session_state.instrument_master
+    try:
+        res = requests.get(INSTRUMENT_MASTER_URL, timeout=20)
+        res.raise_for_status()
+        df  = pd.DataFrame(res.json())
+        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+        df = df[
+            (df["name"].str.upper() == "NIFTY") &
+            (df["instrument_type"].str.upper().isin(["CE", "PE"])) &
+            (df["segment"].str.upper() == "NSE_FO")
+        ].copy()
+        df["expiry_date"] = pd.to_datetime(df["expiry"], dayfirst=True).dt.date
+        df["strike"]      = pd.to_numeric(df["strike_price"], errors="coerce")
+        df["option_type"] = df["instrument_type"].str.upper()
+        st.session_state.instrument_master = df
+        return df
+    except Exception as e:
+        st.warning(f"⚠️ Instrument master load failed: {e}. Using formula fallback.")
+        empty = pd.DataFrame(columns=["instrument_key", "trading_symbol",
+                                       "expiry_date", "strike", "option_type"])
+        st.session_state.instrument_master = empty
+        return empty
 
-    # σ bounds for pre-fetch (uses slider as estimate; real calc happens after live IV is known)
-    # Use a generous range (max of slider IV and 30%) to ensure we fetch enough keys
-    _pre_iv = max(iv_override, 0.30)
-    _std_tmp = spot_price * _pre_iv * np.sqrt(tte_years)
-    _lo1_tmp = spot_price - _std_tmp
-    _hi1_tmp = spot_price + _std_tmp
-    _ic_sell_put = round(_lo1_tmp / diff) * diff
-    _ic_sell_call = round(_hi1_tmp / diff) * diff
-    strategy_strikes = {atm_strike, _ic_sell_put, _ic_sell_call,
-                        _ic_sell_put - diff, _ic_sell_call + diff,
-                        _ic_sell_put - 2*diff, _ic_sell_call + 2*diff}  # Extra buffer
 
-    all_needed_strikes = display_strikes | strategy_strikes
+def get_weekly_expiries(master: pd.DataFrame) -> list[date]:
+    today    = now_ist().date()
+    expiries = sorted(master["expiry_date"].dropna().unique())
+    return [e for e in expiries if e >= today]
 
-    # ── Batch-fetch LTPs from Upstox for ALL needed strikes ──
-    keys_for_ltp = []
-    key_to_strike_opt = {}
-    for strike in all_needed_strikes:
-        for opt_type in ["CE", "PE"]:
-            if (strike, opt_type) in strike_inst_map:
-                ik = strike_inst_map[(strike, opt_type)]
-                keys_for_ltp.append(ik)
-                key_to_strike_opt[ik] = (strike, opt_type)
 
-    live_ltp_map = {}  # (strike, "CE"/"PE") -> ltp
-    if keys_for_ltp:
-        try:
-            with st.spinner(f"Fetching live prices for {len(keys_for_ltp)} contracts..."):
-                fetched = client.get_ltp_batch(keys_for_ltp)
-            for ik, price in fetched.items():
-                if ik in key_to_strike_opt:
-                    live_ltp_map[key_to_strike_opt[ik]] = price
-        except Exception as e:
-            st.warning(f"⚠️ Could not fetch live LTPs: {e}. Using chain data + theoretical prices.")
+def resolve_atm_option_key(token: str, spot: float, option_type: str,
+                            master: pd.DataFrame) -> tuple[str, str]:
+    atm_strike = round(spot / 50) * 50
+    ot         = option_type.upper()
+    if not master.empty:
+        expiries = get_weekly_expiries(master)
+        if expiries:
+            candidates = master[
+                (master["expiry_date"] == expiries[0]) &
+                (master["option_type"] == ot) &
+                (master["strike"].between(atm_strike - 200, atm_strike + 200))
+            ].copy()
+            candidates["dist"] = (candidates["strike"] - atm_strike).abs()
+            for _, row in candidates.sort_values("dist").iterrows():
+                ikey = row["instrument_key"]
+                ltp  = fetch_ltp(token, ikey)
+                if ltp is not None and ltp > 0:
+                    return ikey, row.get("trading_symbol", ikey)
+    # Formula fallback
+    expiry_str = get_active_expiry_str()
+    expiry     = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+    symbol     = f"NIFTY{expiry.strftime('%y%b%d').upper()}{atm_strike}{ot}"
+    return f"NSE_FO|{symbol}", symbol
 
-    # ── Build chain records (filtered by strike_depth for display) ──
-    records = []
 
-    for sd in chain_raw:
-        sp = float(sd.get("strike_price", 0))
-        if abs(sp - atm_strike) > strike_depth * diff:
+# ==============================================================================
+# CORE API HELPERS
+# All instrument_key params are passed via _build_url to avoid encoding.
+# ==============================================================================
+
+def fetch_ltp(token: str, instrument_key: str) -> float | None:
+    url  = _build_url(f"{UPSTOX_BASE_URL}/market-quote/ltp",
+                      {"instrument_key": instrument_key})
+    data = _raw_get(token, url)
+    if data is None:
+        return None
+    try:
+        normalized = instrument_key.replace("|", ":")
+        return float(data["data"][normalized]["last_price"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def fetch_ltp_batch(token: str, instrument_keys: list[str]) -> dict:
+    results = {}
+    for i in range(0, len(instrument_keys), 50):
+        batch = instrument_keys[i : i + 50]
+        url   = _build_url(f"{UPSTOX_BASE_URL}/market-quote/ltp",
+                           {"instrument_key": ",".join(batch)})
+        data  = _raw_get(token, url)
+        if data is None:
             continue
-        ce = sd.get("call_options", {}) or {}
-        pe = sd.get("put_options", {}) or {}
-        ce_md = ce.get("market_data", {}) or {}
-        pe_md = pe.get("market_data", {}) or {}
+        for raw_key, val in data.get("data", {}).items():
+            try:
+                results[raw_key.replace(":", "|")] = float(val["last_price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return results
 
-        ce_oi = int(float(ce_md.get("oi", 0) or 0))
-        pe_oi = int(float(pe_md.get("oi", 0) or 0))
-        # Use live LTP if available, else chain LTP
-        ce_ltp = live_ltp_map.get((sp, "CE"), 0.0) or float(ce_md.get("ltp", 0) or 0)
-        pe_ltp = live_ltp_map.get((sp, "PE"), 0.0) or float(pe_md.get("ltp", 0) or 0)
-        ce_vol = int(float(ce_md.get("volume", 0) or 0))
-        pe_vol = int(float(pe_md.get("volume", 0) or 0))
-        ce_prev_oi = int(float(ce_md.get("prev_oi", ce_oi) or ce_oi))
-        pe_prev_oi = int(float(pe_md.get("prev_oi", pe_oi) or pe_oi))
-        ce_iv_raw = float(ce_md.get("iv", 0) or 0)
-        pe_iv_raw = float(pe_md.get("iv", 0) or 0)
 
-        # ── IV Resolution: Live Market Price → Chain IV → Manual Override ──
-        # Tier 1: Compute IV from live market LTP using Newton-Raphson
-        ce_sigma = None
-        pe_sigma = None
+def fetch_historical_candles(token: str, instrument_key: str,
+                              interval: str = "1minute") -> pd.DataFrame:
+    """
+    Fetches intraday candles. Results are cached in session_state for 30 seconds
+    per interval to avoid redundant API calls when multiple TF layers share the
+    same underlying feed (e.g. 15M and 3M both built from 1min).
+    """
+    cache_key = f"_candle_cache_{interval}"
+    cached    = st.session_state.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 30:
+        return cached["df"].copy()
 
-        if ce_ltp > 0:
-            ce_sigma = implied_vol(ce_ltp, spot_price, sp, tte_years, risk_free_rate, "CE")
-        if pe_ltp > 0:
-            pe_sigma = implied_vol(pe_ltp, spot_price, sp, tte_years, risk_free_rate, "PE")
+    safe_key = instrument_key.replace(" ", "%20")
+    url      = f"{UPSTOX_BASE_URL}/historical-candle/intraday/{safe_key}/{interval}"
+    data = _raw_get(token, url)
+    if data is None:
+        return pd.DataFrame()
+    try:
+        candles = data["data"]["candles"]
+        if not candles:
+            # Empty candles list — do NOT cache, allow retry next cycle
+            return pd.DataFrame()
+        df = pd.DataFrame(candles,
+                          columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+        df = df.iloc[::-1].reset_index(drop=True)
+        for col in ["open", "high", "low", "close", "volume", "oi"]:
+            df[col] = pd.to_numeric(df[col])
+        # Only cache non-empty successful results
+        if not df.empty:
+            st.session_state[cache_key] = {"df": df, "ts": time.time()}
+        return df
+    except Exception as e:
+        # Log the parse error so it appears in the API error log
+        st.session_state.setdefault("api_errors", []).append({
+            "time":     now_ist().strftime("%H:%M:%S"),
+            "endpoint": url.split("api.upstox.com")[-1].split("?")[0],
+            "status":   "parse_error",
+            "body":     str(e)[:200],
+        })
+        return pd.DataFrame()
 
-        # Tier 2: Chain-reported IV (if API provides it)
-        if ce_sigma is None and ce_iv_raw > 0:
-            ce_sigma = ce_iv_raw / 100
-        if pe_sigma is None and pe_iv_raw > 0:
-            pe_sigma = pe_iv_raw / 100
 
-        # Tier 3: Manual slider fallback (will be replaced by iv_for_sigma after ATM IV is known)
-        if ce_sigma is None:
-            ce_sigma = iv_override  # Temporary; best we can do before ATM IV is computed
-        if pe_sigma is None:
-            pe_sigma = iv_override
+def fetch_historical_candles_multi_day(token: str, instrument_key: str,
+                                        interval: str, days_back: int = 60) -> pd.DataFrame:
+    """
+    Fetches historical candles using the NON-intraday endpoint:
+      GET /v2/historical-candle/{key}/{interval}/{to_date}/{from_date}
 
-        # Track source for display
-        ce_iv_source = "live" if (ce_ltp > 0 and implied_vol(ce_ltp, spot_price, sp, tte_years, risk_free_rate, "CE") is not None) else ("chain" if ce_iv_raw > 0 else "manual")
-        pe_iv_source = "live" if (pe_ltp > 0 and implied_vol(pe_ltp, spot_price, sp, tte_years, risk_free_rate, "PE") is not None) else ("chain" if pe_iv_raw > 0 else "manual")
+    Required for 30minute trend analysis — intraday endpoint only returns today's bars.
+    Returns up to days_back calendar days of data, newest-last (chronological).
+    """
+    from datetime import date, timedelta
+    safe_key  = instrument_key.replace(" ", "%20")
+    to_date   = now_ist().date().strftime("%Y-%m-%d")
+    from_date = (now_ist().date() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    cache_key = f"_candle_cache_multiday_{interval}"
+    cached    = st.session_state.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 300:   # 5-minute cache for 30min bars
+        return cached["df"].copy()
 
-        ce_g = bs_greeks(spot_price, sp, tte_years, risk_free_rate, ce_sigma, "CE")
-        pe_g = bs_greeks(spot_price, sp, tte_years, risk_free_rate, pe_sigma, "PE")
+    url  = f"{UPSTOX_BASE_URL}/historical-candle/{safe_key}/{interval}/{to_date}/{from_date}"
+    data = _raw_get(token, url)
+    if data is None:
+        return pd.DataFrame()
+    try:
+        candles = data["data"]["candles"]
+        df = pd.DataFrame(candles,
+                          columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+        df = df.iloc[::-1].reset_index(drop=True)
+        for col in ["open", "high", "low", "close", "volume", "oi"]:
+            df[col] = pd.to_numeric(df[col])
+        st.session_state[cache_key] = {"df": df, "ts": time.time()}
+        return df
+    except Exception:
+        return pd.DataFrame()
 
+
+def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
+    """Fetches session VWAP from /market-quote/ohlc using raw URL."""
+    if not token:
+        return None
+    url  = _build_url(f"{UPSTOX_BASE_URL}/market-quote/ohlc",
+                      {"instrument_key": instrument_key, "interval": "1d"})
+    data = _raw_get(token, url)
+    if not data:
+        return None
+    try:
+        normalized = instrument_key.replace("|", ":")
+        vwap = data["data"][normalized]["ohlc"].get("vwap")
+        return float(vwap) if vwap else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+# ==============================================================================
+# OPTION CHAIN OI
+# ── Uses _build_url so "NSE_INDEX|Nifty 50" is sent raw (not URL-encoded).
+# ── oi_available flag: when False, OI gate is bypassed in signal logic
+#    so a temporary OI outage does not silently block all entries.
+# ==============================================================================
+
+def fetch_option_chain_oi(token: str, spot: float) -> dict:
+    atm_strike = round(spot / 50) * 50
+    # Get expiry from Upstox directly — most reliable source
+    expiry_str = get_active_expiry_from_upstox(token)
+
+    # ── Raw URL — pipe and space sent exactly as Upstox expects ──────────────
+    url  = _build_url(f"{UPSTOX_BASE_URL}/option/chain",
+                      {"instrument_key": "NSE_INDEX|Nifty 50",
+                       "expiry_date":    expiry_str})
+    data = _raw_get(token, url)
+
+    empty = {
+        "atm_strike": atm_strike, "ce_oi": 0, "pe_oi": 0, "pcr": 1.0,
+        "ce_oi_chg": 0, "pe_oi_chg": 0,
+        "oi_surge_ce": False, "oi_surge_pe": False,
+        "oi_available": False,
+    }
+    if data is None:
+        return empty
+
+    # Store raw response for diagnostic panel
+    st.session_state["oi_last_raw"] = {
+        "status": "200",
+        "data_keys": list(data.keys()) if isinstance(data, dict) else str(type(data)),
+        "data_length": len(data.get("data", [])) if isinstance(data, dict) else 0,
+        "sample": str(data)[:400],
+    }
+
+    try:
+        chain = data.get("data", [])
+
+        # Empty chain — API returned 200 but no contracts for this expiry
+        if not chain:
+            st.session_state.setdefault("api_errors", []).append({
+                "time": now_ist().strftime("%H:%M:%S"),
+                "endpoint": "/option/chain",
+                "status": "200_EMPTY",
+                "body": (
+                    f"Empty data array for expiry_date={expiry_str}. "
+                    "Possible causes: (1) expiry not yet listed by Upstox, "
+                    "(2) outside market hours — OI data unavailable, "
+                    "(3) try next Tuesday expiry."
+                ),
+            })
+            return empty
+
+        atm_row = min(chain, key=lambda r: abs(float(r.get("strike_price", 0)) - atm_strike))
+        ce_oi   = float(atm_row.get("call_options", {}).get("market_data", {}).get("oi", 0))
+        pe_oi   = float(atm_row.get("put_options",  {}).get("market_data", {}).get("oi", 0))
+        pcr     = (pe_oi / ce_oi) if ce_oi > 0 else 1.0
+        prev    = st.session_state.get("oi_snapshot", {})
+        history = st.session_state.get("oi_history", [])
+        avg_ce, avg_pe = (
+            (sum(h["ce_oi"] for h in history[-5:]) / 5,
+             sum(h["pe_oi"] for h in history[-5:]) / 5)
+            if len(history) >= 5 else (ce_oi, pe_oi)
+        )
+        st.session_state.oi_snapshot = {"ce_oi": ce_oi, "pe_oi": pe_oi}
+        history.append({"ce_oi": ce_oi, "pe_oi": pe_oi})
+        st.session_state.oi_history = history[-20:]
+        return {
+            "atm_strike":  float(atm_row.get("strike_price", atm_strike)),
+            "ce_oi":       ce_oi,
+            "pe_oi":       pe_oi,
+            "pcr":         pcr,
+            "ce_oi_chg":   ce_oi - prev.get("ce_oi", ce_oi),
+            "pe_oi_chg":   pe_oi - prev.get("pe_oi", pe_oi),
+            "oi_surge_ce": ce_oi >= OI_SURGE_RATIO * avg_ce if avg_ce > 0 else False,
+            "oi_surge_pe": pe_oi >= OI_SURGE_RATIO * avg_pe if avg_pe > 0 else False,
+            "oi_available": True,
+        }
+    except Exception:
+        return empty
+
+
+# ==============================================================================
+# ORDER ROUTING
+# ==============================================================================
+
+def place_order(token: str, instrument_key: str, transaction_type: str,
+                quantity: int, order_type: str = "MARKET",
+                price: float = 0.0, paper_mode: bool = True) -> str | None:
+    sim_id = f"PAPER-{now_ist().strftime('%H%M%S%f')}"
+    if paper_mode:
+        st.session_state.setdefault("order_log", []).append({
+            "time": now_ist().isoformat(), "mode": "PAPER",
+            "instrument_key": instrument_key, "type": transaction_type,
+            "qty": quantity, "order_type": order_type, "price": price,
+            "order_id": sim_id, "status": "SIMULATED",
+        })
+        return sim_id
+
+    url     = f"{UPSTOX_BASE_URL}/order/place"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    payload = {
+        "quantity":           quantity,
+        "product":            "I",
+        "validity":           "DAY",
+        "price":              price if order_type == "LIMIT" else 0,
+        "tag":                "SCALPER",
+        "instrument_token":   instrument_key,
+        "order_type":         order_type,
+        "transaction_type":   transaction_type,
+        "disclosed_quantity": 0,
+        "trigger_price":      0,
+        "is_amo":             False,
+    }
+    delay = BASE_BACKOFF_S
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=8)
+            if res.status_code == 200:
+                order_id = res.json()["data"]["order_id"]
+                st.session_state.setdefault("order_log", []).append({
+                    "time": now_ist().isoformat(), "mode": "LIVE",
+                    "instrument_key": instrument_key, "type": transaction_type,
+                    "qty": quantity, "order_type": order_type, "price": price,
+                    "order_id": order_id, "status": "PLACED",
+                })
+                return order_id
+            if res.status_code == 429:
+                time.sleep(float(res.headers.get("Retry-After", delay)))
+                delay *= 2
+                continue
+            err = res.json().get("errors", [{}])[0].get("message", res.text)
+            st.error(f"🚨 Order rejected ({res.status_code}): {err}")
+            return None
+        except Exception:
+            time.sleep(delay)
+            delay *= 2
+    st.error("🚨 Order placement failed after max retries.")
+    return None
+
+
+def exit_position(token: str, pos: dict, exit_price: float, exit_reason: str,
+                  paper_mode: bool, lot_size: int) -> None:
+    order_id      = place_order(token, pos["key"], "SELL", lot_size,
+                                order_type="MARKET", paper_mode=paper_mode)
+    gross_pnl     = (exit_price - pos["entry_price"]) * lot_size
+    slippage      = SLIPPAGE_PER_SIDE * 2 * lot_size
+    net_pnl       = gross_pnl - slippage
+    risk_per_unit = abs(pos["entry_price"] - pos["sl_price"])
+    rr_realised   = round(gross_pnl / (risk_per_unit * lot_size), 2) if risk_per_unit > 0 else 0.0
+
+    st.session_state.session_pnl += net_pnl
+    st.session_state.trade_logs.append({
+        "Date":        now_ist().date().isoformat(),
+        "Entry Time":  pos["entry_time"],
+        "Exit Time":   now_ist().strftime("%H:%M:%S"),
+        "Symbol":      pos["symbol"],
+        "Direction":   pos["direction"],
+        "Mode":        "LIVE" if not paper_mode else "PAPER",
+        "Entry ₹":     pos["entry_price"],
+        "Exit ₹":      exit_price,
+        "Peak ₹":      pos["highest_price"],
+        "SL ₹":        pos["sl_price"],
+        "Target ₹":    pos["target_price"],
+        "Gross PnL ₹": round(gross_pnl, 2),
+        "Slippage ₹":  round(slippage, 2),
+        "Net PnL ₹":   round(net_pnl, 2),
+        "RR Realised": rr_realised,
+        "Exit Reason": exit_reason,
+        "Entry Order": pos.get("entry_order_id", "—"),
+        "Exit Order":  order_id or "—",
+    })
+
+    if net_pnl <= 0:
+        st.session_state.loss_streak += 1
+        if st.session_state.loss_streak >= MAX_LOSS_STREAK:
+            st.session_state.bot_active = False
+            st.error(f"🚨 Circuit breaker: {MAX_LOSS_STREAK} consecutive losses. Bot halted.")
+    else:
+        st.session_state.loss_streak = 0
+    st.session_state.current_position = None
+
+
+# ==============================================================================
+# GUARDRAIL + INDICATOR HELPERS
+# ==============================================================================
+
+def check_daily_guardrails(session_pnl: float, trade_count: int,
+                            max_daily_loss: float, max_trades: int) -> tuple[bool, str]:
+    if session_pnl <= -abs(max_daily_loss):
+        return False, f"🚨 Daily loss limit ₹{abs(max_daily_loss):,.0f} hit. Bot halted."
+    if trade_count >= max_trades:
+        return False, f"📊 Max {max_trades} trades/day reached. Bot paused."
+    if not in_prime_session():
+        return False, f"🕐 Outside prime window. Next: {next_window_str()}"
+    return True, ""
+
+
+# ==============================================================================
+# MULTI-TIMEFRAME INDICATOR ENGINE
+# Architecture:
+#   1H  bars → Trend direction  (EMA 20/50, ADX, Supertrend)
+#   15M bars → Momentum confirm (EMA 9/21 state, RSI, VWAP side)
+#   3M  bars → Trade trigger    (EMA 9/21 state, volume surge, RSI slope)
+#
+# FIX applied: EMA STATE (EMA_fast > EMA_slow) used everywhere — NOT crossover.
+# State is true for many bars during a trend, giving realistic signal frequency.
+# ==============================================================================
+
+def compute_supertrend(df: pd.DataFrame, length: int = 7,
+                        multiplier: float = 3.0) -> pd.Series:
+    hl_avg    = (df["high"] + df["low"]) / 2
+    atr       = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=length)
+    upper     = hl_avg + multiplier * atr
+    lower     = hl_avg - multiplier * atr
+    direction = pd.Series(1, index=df.index)
+    for i in range(1, len(df)):
+        if df["close"].iloc[i] > upper.iloc[i - 1]:
+            direction.iloc[i] = 1
+        elif df["close"].iloc[i] < lower.iloc[i - 1]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i - 1]
+    return direction
+
+
+def compute_atr_sl_target(df, entry_ltp, atr_multiplier, rr_min, delta=0.5):
+    atr     = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
+    atr_val = float(atr.dropna().iloc[-1]) if not atr.dropna().empty else 0
+    if atr_val <= 0:
+        return None
+    sl_distance  = atr_val * atr_multiplier * delta
+    tgt_distance = sl_distance * rr_min
+    sl_price     = entry_ltp - sl_distance
+    target_price = entry_ltp + tgt_distance
+    if sl_price <= 0 or sl_price >= entry_ltp:
+        return None
+    return round(sl_price, 2), round(target_price, 2)
+
+
+def resample_candles(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """
+    Resamples 1-min OHLCV candles into n-minute bars by grouping every n rows.
+    Used to synthesise 3-min and 15-min candles from the 1-min intraday feed
+    since Upstox intraday only supports 1minute and 30minute intervals.
+    """
+    if df.empty or n <= 1:
+        return df
+    records = []
+    for i in range(0, len(df) - (len(df) % n), n):
+        chunk = df.iloc[i : i + n]
         records.append({
-            "CE OI": ce_oi, "CE OI Chg": ce_oi - ce_prev_oi, "CE Vol": ce_vol,
-            "CE IV": round(ce_sigma*100, 1),
-            "CE Delta": ce_g["delta"], "CE Gamma": ce_g["gamma"],
-            "CE Theta": ce_g["theta"], "CE Vega": ce_g["vega"],
-            "CE LTP": ce_ltp,
-            "Strike": sp,
-            "PE LTP": pe_ltp,
-            "PE Vega": pe_g["vega"], "PE Theta": pe_g["theta"],
-            "PE Gamma": pe_g["gamma"], "PE Delta": pe_g["delta"],
-            "PE IV": round(pe_sigma*100, 1),
-            "PE Vol": pe_vol, "PE OI Chg": pe_oi - pe_prev_oi, "PE OI": pe_oi,
+            "timestamp": chunk["timestamp"].iloc[0],
+            "open":      chunk["open"].iloc[0],
+            "high":      chunk["high"].max(),
+            "low":       chunk["low"].min(),
+            "close":     chunk["close"].iloc[-1],
+            "volume":    chunk["volume"].sum(),
+            "oi":        chunk["oi"].iloc[-1],
         })
+    return pd.DataFrame(records).reset_index(drop=True)
 
-    df = pd.DataFrame(records).sort_values("Strike").reset_index(drop=True)
 
-    # Force numeric types on all data columns
-    numeric_cols = [c for c in df.columns if c != "Strike"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    df["Strike"] = df["Strike"].astype(float)
+def build_resampled_indicators(df_1min: pd.DataFrame, n: int) -> pd.DataFrame:
+    """
+    Resamples 1-min OHLCV into N-min candles and computes indicators.
 
-    # ── Derived metrics ──
-    total_ce_oi = df["CE OI"].sum()
-    total_pe_oi = df["PE OI"].sum()
-    pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
-    max_pain = compute_max_pain(df)
-    resistance = df.loc[df["CE OI"].idxmax(), "Strike"] if not df.empty else atm_strike
-    support = df.loc[df["PE OI"].idxmax(), "Strike"] if not df.empty else atm_strike
+    Key insight: ta library fills NaN with 0 by default — so 9 resampled bars
+    with EMA21 gives wrong values (0-filled), not NaN. We cannot use dropna
+    to detect bad values. Instead we ensure enough resampled bars exist:
+      - EMA21 needs >=21 bars to be accurate
+      - RSI14 needs >=14 bars
+      - Minimum safe threshold: 22 resampled bars
 
-    # IV Percentile — use live-computed ATM IV
-    atm_row = df[df["Strike"] == atm_strike]
-    atm_iv = float(atm_row.iloc[0]["CE IV"]) if not atm_row.empty else iv_override * 100
-    atm_iv_is_live = atm_iv != iv_override * 100  # True if IV came from market, not slider
-    iv_pct = compute_iv_percentile(candles_df, atm_iv / 100, window=20)
+    If fewer than 22 bars exist after resampling, return empty df so the
+    caller handles it gracefully rather than using wrong indicator values.
+    """
+    MIN_RESAMPLED = 22   # enough for EMA21 + 1 buffer bar
 
-    # Use live ATM IV for σ calculations when available
-    iv_for_sigma = atm_iv / 100 if atm_iv_is_live else iv_override
+    if df_1min.empty or len(df_1min) < n * MIN_RESAMPLED:
+        return pd.DataFrame()
 
-    # ── Recompute Greeks for strikes that used manual IV fallback ──
-    # Now that iv_for_sigma is known, upgrade any strike stuck on iv_override
-    if atm_iv_is_live:
-        for idx, row in df.iterrows():
-            sp = row["Strike"]
-            ce_iv_val = row["CE IV"]
-            pe_iv_val = row["PE IV"]
-            recompute = False
-
-            # If CE IV equals the slider value, it was a fallback — use live ATM IV instead
-            if abs(ce_iv_val - iv_override * 100) < 0.01:
-                ce_sigma_new = iv_for_sigma
-                df.at[idx, "CE IV"] = round(iv_for_sigma * 100, 1)
-                recompute = True
-            else:
-                ce_sigma_new = ce_iv_val / 100
-
-            if abs(pe_iv_val - iv_override * 100) < 0.01:
-                pe_sigma_new = iv_for_sigma
-                df.at[idx, "PE IV"] = round(iv_for_sigma * 100, 1)
-            else:
-                pe_sigma_new = pe_iv_val / 100
-
-            if recompute or abs(pe_iv_val - iv_override * 100) < 0.01:
-                ce_g = bs_greeks(spot_price, sp, tte_years, risk_free_rate, ce_sigma_new, "CE")
-                pe_g = bs_greeks(spot_price, sp, tte_years, risk_free_rate, pe_sigma_new, "PE")
-                df.at[idx, "CE Delta"] = ce_g["delta"]
-                df.at[idx, "CE Gamma"] = ce_g["gamma"]
-                df.at[idx, "CE Theta"] = ce_g["theta"]
-                df.at[idx, "CE Vega"] = ce_g["vega"]
-                df.at[idx, "PE Delta"] = pe_g["delta"]
-                df.at[idx, "PE Gamma"] = pe_g["gamma"]
-                df.at[idx, "PE Theta"] = pe_g["theta"]
-                df.at[idx, "PE Vega"] = pe_g["vega"]
-
-    # Volume-Weighted Average Strike
-    total_vol = df["CE Vol"].sum() + df["PE Vol"].sum()
-    vwas = ((df["Strike"] * (df["CE Vol"] + df["PE Vol"])).sum()) / total_vol if total_vol > 0 else atm_strike
-
-    # PCR history in session state for sparkline
-    if "pcr_history" not in st.session_state:
-        st.session_state.pcr_history = []
-    st.session_state.pcr_history.append({"time": datetime.now().strftime("%H:%M:%S"), "pcr": pcr})
-    if len(st.session_state.pcr_history) > 60:
-        st.session_state.pcr_history = st.session_state.pcr_history[-60:]
-
-    # Sentiment
-    if pcr >= 1.25:
-        sentiment, sent_color = "STRONG BULLISH", "#15803d"
-        card_bg = "linear-gradient(135deg, #15803d, #166534)"
-    elif pcr > 1.05:
-        sentiment, sent_color = "MILDLY BULLISH", "#22c55e"
-        card_bg = "linear-gradient(135deg, #065f46, #064e3b)"
-    elif pcr <= 0.75:
-        sentiment, sent_color = "STRONG BEARISH", "#dc2626"
-        card_bg = "linear-gradient(135deg, #991b1b, #7f1d1d)"
-    elif pcr < 0.95:
-        sentiment, sent_color = "MILDLY BEARISH", "#ef4444"
-        card_bg = "linear-gradient(135deg, #b91c1c, #991b1b)"
-    else:
-        sentiment, sent_color = "NEUTRAL", "#64748b"
-        card_bg = "linear-gradient(135deg, #475569, #334155)"
-
-    # σ bounds — uses live ATM IV when available
-    std_price = spot_price * iv_for_sigma * np.sqrt(tte_years)
-    lo1 = spot_price - std_price
-    hi1 = spot_price + std_price
-    lo2 = spot_price - 2*std_price
-    hi2 = spot_price + 2*std_price
-
-    # Strategy strikes
-    ic_sell_put = round(lo1 / diff) * diff
-    ic_sell_call = round(hi1 / diff) * diff
-    ic_buy_put = ic_sell_put - diff
-    ic_buy_call = ic_sell_call + diff
-
-    # ═══════════════════════════════════════════════
-    #  TOP KPI ROW
-    # ═══════════════════════════════════════════════
-
-    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
-    k1.metric("Spot", f"₹{spot_price:,.2f}")
-    k2.metric("ATM", f"{atm_strike:,.0f}")
-    k3.metric("PCR", f"{pcr}")
-    k4.metric("Max Pain", f"{max_pain:,.0f}")
-    k5.metric("VWAS", f"{vwas:,.0f}")
-    adx_val = adx_metrics["adx"] if adx_metrics else None
-    k6.metric("ADX (14)", f"{adx_val}" if adx_val else "—",
-              f"+DI {adx_metrics['plus_di']}/-DI {adx_metrics['minus_di']}" if adx_metrics else None)
-    k7.metric("DTE", f"{tte_days:.1f} days")
-
-    # ── IV Percentile Gauge ──
-    iv_color = "#22c55e" if iv_pct < 30 else "#f59e0b" if iv_pct < 70 else "#ef4444"
-    iv_source_tag = '<span style="font-size:9px; color:#4ade80; background:rgba(34,197,94,0.15); padding:1px 6px; border-radius:3px; margin-left:6px;">LIVE</span>' if atm_iv_is_live else '<span style="font-size:9px; color:#f59e0b; background:rgba(245,158,11,0.15); padding:1px 6px; border-radius:3px; margin-left:6px;">MANUAL</span>'
-    st.markdown(f"""
-    <div style="display:flex; align-items:center; gap:14px; margin:8px 0 4px 0;">
-        <span style="font-size:11px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; font-weight:600; min-width:110px;">IV Percentile</span>
-        <div class="iv-gauge-bar" style="flex:1;">
-            <div class="iv-gauge-marker" style="left:{min(iv_pct, 100)}%;"></div>
-        </div>
-        <span class="iv-pct-label" style="color:{iv_color};">{iv_pct:.0f}%</span>
-        <span style="font-size:11px; color:#e2e8f0; font-weight:600;">ATM IV: {atm_iv:.1f}%</span>
-        {iv_source_tag}
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Sentiment Card ──
-    st.markdown(f"""
-    <div class="signal-card" style="background:{card_bg};">
-        <div class="signal-label">Structural Trend Signal</div>
-        <div class="signal-value">{sentiment}</div>
-        <div class="signal-sub">
-            Put OI: {total_pe_oi:,.0f} &nbsp;·&nbsp; Call OI: {total_ce_oi:,.0f}
-            &nbsp;&nbsp;
-            <span class="badge badge-green">Support {support:,.0f}</span>
-            <span class="badge badge-red">Resistance {resistance:,.0f}</span>
-            <span class="badge badge-purple">Max Pain {max_pain:,.0f}</span>
-            <span class="badge badge-amber">IV Pct {iv_pct:.0f}%</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── VWAS Highlight Bar ──
-    vwas_diff = vwas - spot_price
-    vwas_dir = "above" if vwas_diff > 0 else "below" if vwas_diff < 0 else "at"
-    vwas_arrow = "▲" if vwas_diff > 0 else "▼" if vwas_diff < 0 else "●"
-    vwas_clr = "#4ade80" if vwas_diff > 0 else "#f87171" if vwas_diff < 0 else "#e2e8f0"
-    st.markdown(f"""
-    <div style="display:flex; align-items:center; justify-content:space-between; padding:14px 20px; margin:10px 0 14px 0;
-                border:1px solid #1e293b; border-radius:10px; background:rgba(17,24,39,0.7);">
-        <div style="display:flex; align-items:center; gap:14px;">
-            <span style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:1.8px; font-weight:600;">
-                Volume-Weighted Avg Strike
-            </span>
-            <span style="font-family:'JetBrains Mono',monospace; font-size:26px; font-weight:800; color:#ffffff;">
-                {vwas:,.0f}
-            </span>
-        </div>
-        <div style="display:flex; align-items:center; gap:10px;">
-            <span style="font-family:'JetBrains Mono',monospace; font-size:14px; font-weight:700; color:{vwas_clr};">
-                {vwas_arrow} {abs(vwas_diff):,.1f} pts {vwas_dir} spot
-            </span>
-            <span style="font-size:11px; color:#64748b;">
-                (money flow bias)
-            </span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ═══════════════════════════════════════════════
-    #  OI-CHANGE DIRECTIONAL FORECAST
-    # ═══════════════════════════════════════════════
-
-    # Analyze OI change patterns to predict direction and magnitude
-    ce_chg_total = df["CE OI Chg"].sum()
-    pe_chg_total = df["PE OI Chg"].sum()
-
-    # Weighted OI change — strikes closer to ATM matter more
-    df_tmp = df.copy()
-    df_tmp["dist"] = abs(df_tmp["Strike"] - atm_strike)
-    max_dist = df_tmp["dist"].max()
-    df_tmp["weight"] = 1.0 - (df_tmp["dist"] / (max_dist + 1)) if max_dist > 0 else 1.0
-
-    w_ce_buildup = (df_tmp["CE OI Chg"] * df_tmp["weight"]).sum()
-    w_pe_buildup = (df_tmp["PE OI Chg"] * df_tmp["weight"]).sum()
-
-    # Find the highest CE OI change strike (new resistance forming)
-    # and highest PE OI change strike (new support forming)
-    ce_chg_positive = df[df["CE OI Chg"] > 0]
-    pe_chg_positive = df[df["PE OI Chg"] > 0]
-
-    new_resistance = float(ce_chg_positive.loc[ce_chg_positive["CE OI Chg"].idxmax(), "Strike"]) if not ce_chg_positive.empty else resistance
-    new_support = float(pe_chg_positive.loc[pe_chg_positive["PE OI Chg"].idxmax(), "Strike"]) if not pe_chg_positive.empty else support
-
-    # OI interpretation matrix:
-    # Call OI build-up = writers selling calls = bearish (they don't think it'll go up)
-    # Put OI build-up = writers selling puts = bullish (they don't think it'll go down)
-    # Call OI unwinding = writers exiting calls = bullish (removing ceiling)
-    # Put OI unwinding = writers exiting puts = bearish (removing floor)
-
-    signals = []
-    direction_score = 0  # positive = bullish, negative = bearish
-
-    # Signal 1: Net OI change direction
-    if pe_chg_total > 0 and ce_chg_total > 0:
-        if pe_chg_total > ce_chg_total * 1.3:
-            direction_score += 25
-            signals.append(("Put OI build-up dominates Call build-up", "bullish",
-                           f"Put writers added {pe_chg_total:+,.0f} vs Call writers {ce_chg_total:+,.0f} — fresh support being built"))
-        elif ce_chg_total > pe_chg_total * 1.3:
-            direction_score -= 25
-            signals.append(("Call OI build-up dominates Put build-up", "bearish",
-                           f"Call writers added {ce_chg_total:+,.0f} vs Put writers {pe_chg_total:+,.0f} — fresh resistance being built"))
-        else:
-            signals.append(("Balanced OI build-up on both sides", "neutral",
-                           f"Call Δ: {ce_chg_total:+,.0f}, Put Δ: {pe_chg_total:+,.0f} — no clear directional bias from OI change"))
-    elif pe_chg_total > 0 and ce_chg_total <= 0:
-        direction_score += 30
-        signals.append(("Put build-up + Call unwinding", "bullish",
-                       f"Writers adding puts ({pe_chg_total:+,.0f}) and exiting calls ({ce_chg_total:+,.0f}) — strong bullish conviction"))
-    elif ce_chg_total > 0 and pe_chg_total <= 0:
-        direction_score -= 30
-        signals.append(("Call build-up + Put unwinding", "bearish",
-                       f"Writers adding calls ({ce_chg_total:+,.0f}) and exiting puts ({pe_chg_total:+,.0f}) — strong bearish conviction"))
-    elif ce_chg_total < 0 and pe_chg_total < 0:
-        signals.append(("Both Call and Put OI unwinding", "neutral",
-                       f"Writers exiting both sides — potential for big move in either direction (breakout likely)"))
-
-    # Signal 2: Where is the fresh build-up relative to spot
-    if not ce_chg_positive.empty:
-        ce_buildup_above = ce_chg_positive[ce_chg_positive["Strike"] > spot_price]["CE OI Chg"].sum()
-        ce_buildup_below = ce_chg_positive[ce_chg_positive["Strike"] <= spot_price]["CE OI Chg"].sum()
-        if ce_buildup_above > ce_buildup_below * 2:
-            direction_score -= 10
-            signals.append(("Call writing concentrated above spot", "bearish",
-                           f"Fresh Call OI build-up at {new_resistance:,.0f} — resistance wall forming"))
-    if not pe_chg_positive.empty:
-        pe_buildup_below = pe_chg_positive[pe_chg_positive["Strike"] < spot_price]["PE OI Chg"].sum()
-        pe_buildup_above = pe_chg_positive[pe_chg_positive["Strike"] >= spot_price]["PE OI Chg"].sum()
-        if pe_buildup_below > pe_buildup_above * 2:
-            direction_score += 10
-            signals.append(("Put writing concentrated below spot", "bullish",
-                           f"Fresh Put OI build-up at {new_support:,.0f} — support floor forming"))
-
-    # Signal 3: Near-ATM weighted bias
-    if abs(w_pe_buildup) + abs(w_ce_buildup) > 0:
-        near_atm_ratio = w_pe_buildup / (abs(w_pe_buildup) + abs(w_ce_buildup))
-        if near_atm_ratio > 0.6:
-            direction_score += 15
-            signals.append(("Near-ATM OI skews toward Put writing", "bullish",
-                           "Writers near ATM are predominantly selling puts — immediate upside expected"))
-        elif near_atm_ratio < 0.4:
-            direction_score -= 15
-            signals.append(("Near-ATM OI skews toward Call writing", "bearish",
-                           "Writers near ATM are predominantly selling calls — immediate downside expected"))
-
-    # Compute expected move from OI structure
-    upside_target = new_resistance  # Ceiling
-    downside_target = new_support   # Floor
-    upside_pts = upside_target - spot_price
-    downside_pts = spot_price - downside_target
-
-    # Direction determination
-    if direction_score >= 20:
-        dir_label = "BULLISH"
-        dir_color = "#4ade80"
-        dir_bg = "linear-gradient(135deg, rgba(34,197,94,0.15), rgba(17,24,39,0.8))"
-        dir_icon = "🟢"
-        dir_arrow = "▲"
-        primary_target = upside_target
-        primary_pts = upside_pts
-        secondary_target = downside_target
-    elif direction_score <= -20:
-        dir_label = "BEARISH"
-        dir_color = "#f87171"
-        dir_bg = "linear-gradient(135deg, rgba(239,68,68,0.15), rgba(17,24,39,0.8))"
-        dir_icon = "🔴"
-        dir_arrow = "▼"
-        primary_target = downside_target
-        primary_pts = downside_pts
-        secondary_target = upside_target
-    else:
-        dir_label = "SIDEWAYS"
-        dir_color = "#fbbf24"
-        dir_bg = "linear-gradient(135deg, rgba(245,158,11,0.12), rgba(17,24,39,0.8))"
-        dir_icon = "🟡"
-        dir_arrow = "↔"
-        primary_target = max_pain
-        primary_pts = abs(spot_price - max_pain)
-        secondary_target = max_pain
-
-    # Build signals HTML
-    signals_html = ""
-    for title, bias, detail in signals:
-        if bias == "bullish":
-            dot = '<span style="color:#4ade80;">●</span>'
-        elif bias == "bearish":
-            dot = '<span style="color:#f87171;">●</span>'
-        else:
-            dot = '<span style="color:#fbbf24;">●</span>'
-        signals_html += f"""
-        <div style="padding:6px 0; border-bottom:1px solid rgba(30,41,59,0.5);">
-            <div style="font-size:13px; font-weight:600; color:#e2e8f0;">{dot} {title}</div>
-            <div style="font-size:11px; color:#94a3b8; margin-top:2px; padding-left:16px;">{detail}</div>
-        </div>"""
-
-    st.markdown(f"""
-    <div style="border:1px solid #1e293b; border-radius:12px; padding:0; margin:12px 0 14px 0;
-                background:{dir_bg}; overflow:hidden;">
-        <!-- Header -->
-        <div style="display:flex; align-items:center; justify-content:space-between;
-                    padding:16px 20px; border-bottom:1px solid #1e293b;">
-            <div style="display:flex; align-items:center; gap:10px;">
-                <span style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:2px; font-weight:600;">
-                    OI Change Directional Forecast
-                </span>
-            </div>
-            <div style="display:flex; align-items:center; gap:8px;">
-                <span style="font-size:22px;">{dir_icon}</span>
-                <span style="font-size:20px; font-weight:800; color:{dir_color}; font-family:'JetBrains Mono',monospace;">
-                    {dir_label}
-                </span>
-            </div>
-        </div>
-        <!-- Targets Row -->
-        <div style="display:flex; padding:14px 20px; gap:0; border-bottom:1px solid #1e293b;">
-            <div style="flex:1; text-align:center; border-right:1px solid #1e293b;">
-                <div style="font-size:9px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; font-weight:600;">
-                    Downside Target
-                </div>
-                <div style="font-family:'JetBrains Mono',monospace; font-size:20px; font-weight:800; color:#f87171; margin-top:4px;">
-                    {downside_target:,.0f}
-                </div>
-                <div style="font-size:11px; color:#f87171;">▼ {downside_pts:,.0f} pts</div>
-            </div>
-            <div style="flex:1; text-align:center; border-right:1px solid #1e293b;">
-                <div style="font-size:9px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; font-weight:600;">
-                    Spot Now
-                </div>
-                <div style="font-family:'JetBrains Mono',monospace; font-size:20px; font-weight:800; color:#ffffff; margin-top:4px;">
-                    {spot_price:,.1f}
-                </div>
-                <div style="font-size:11px; color:#94a3b8;">ATM {atm_strike:,.0f}</div>
-            </div>
-            <div style="flex:1; text-align:center;">
-                <div style="font-size:9px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; font-weight:600;">
-                    Upside Target
-                </div>
-                <div style="font-family:'JetBrains Mono',monospace; font-size:20px; font-weight:800; color:#4ade80; margin-top:4px;">
-                    {upside_target:,.0f}
-                </div>
-                <div style="font-size:11px; color:#4ade80;">▲ {upside_pts:,.0f} pts</div>
-            </div>
-        </div>
-        <!-- OI Change Summary -->
-        <div style="display:flex; padding:10px 20px; gap:0; border-bottom:1px solid #1e293b;">
-            <div style="flex:1; text-align:center;">
-                <span style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:1px;">Call OI Δ</span><br>
-                <span style="font-family:'JetBrains Mono',monospace; font-size:15px; font-weight:700;
-                             color:{'#f87171' if ce_chg_total > 0 else '#4ade80'};">
-                    {ce_chg_total:+,.0f}
-                </span>
-                <span style="font-size:10px; color:#64748b;"> {'(resistance ↑)' if ce_chg_total > 0 else '(ceiling removed)'}</span>
-            </div>
-            <div style="flex:1; text-align:center;">
-                <span style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:1px;">Put OI Δ</span><br>
-                <span style="font-family:'JetBrains Mono',monospace; font-size:15px; font-weight:700;
-                             color:{'#4ade80' if pe_chg_total > 0 else '#f87171'};">
-                    {pe_chg_total:+,.0f}
-                </span>
-                <span style="font-size:10px; color:#64748b;"> {'(support ↑)' if pe_chg_total > 0 else '(floor removed)'}</span>
-            </div>
-        </div>
-        <!-- Signals -->
-        <div style="padding:12px 20px;">
-            <div style="font-size:9px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; font-weight:600; margin-bottom:6px;">
-                Signal Breakdown
-            </div>
-            {signals_html}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ═══════════════════════════════════════════════
-    #  TABBED LAYOUT
-    # ═══════════════════════════════════════════════
-
-    tab_dash, tab_chain, tab_strat, tab_charts = st.tabs([
-        "📊 Dashboard", "📋 Options Chain", "🛡️ Strategy Builder", "📈 Charts"
-    ])
-
-    # ──────────────────────────────────
-    #  TAB 1: DASHBOARD
-    # ──────────────────────────────────
-    with tab_dash:
-
-        # Normal distribution
-        st.markdown("#### 🎯 Statistical Price Forecast")
-        pc1, pc2, pc3, pc4 = st.columns(4)
-        pc1.metric("2σ Low (95.4%)", f"₹{lo2:,.0f}")
-        pc2.metric("1σ Low (68.2%)", f"₹{lo1:,.0f}")
-        pc3.metric("1σ High (68.2%)", f"₹{hi1:,.0f}")
-        pc4.metric("2σ High (95.4%)", f"₹{hi2:,.0f}")
-
-        # Bell curve with Plotly
-        x = np.linspace(spot_price - 3.5*std_price, spot_price + 3.5*std_price, 400)
-        y = norm.pdf(x, spot_price, std_price)
-
-        fig_bell = go.Figure()
-        # 2σ fill
-        mask_2s = (x >= lo2) & (x <= hi2)
-        fig_bell.add_trace(go.Scatter(x=x[mask_2s], y=y[mask_2s], fill="tozeroy",
-            fillcolor="rgba(59,130,246,0.08)", line=dict(width=0), name="95.4% (2σ)", showlegend=True))
-        # 1σ fill
-        mask_1s = (x >= lo1) & (x <= hi1)
-        fig_bell.add_trace(go.Scatter(x=x[mask_1s], y=y[mask_1s], fill="tozeroy",
-            fillcolor="rgba(56,189,248,0.22)", line=dict(width=0), name="68.2% (1σ)", showlegend=True))
-        # PDF line
-        fig_bell.add_trace(go.Scatter(x=x, y=y, mode="lines",
-            line=dict(color="#e2e8f0", width=2), name="PDF"))
-        # Vertical lines
-        for val, clr, nm, dash in [
-            (spot_price, "#f1f5f9", "Spot", "solid"),
-            (max_pain, "#8b5cf6", "Max Pain", "dashdot"),
-            (support, "#22c55e", "Support", "dot"),
-            (resistance, "#ef4444", "Resistance", "dot"),
-        ]:
-            fig_bell.add_vline(x=val, line=dict(color=clr, width=1.5, dash=dash),
-                               annotation_text=nm, annotation_position="top")
-
-        fig_bell.update_layout(**PLOTLY_LAYOUT, height=320,
-            title=dict(text=f"Expiry Forecast — {selected_index_name} ({selected_expiry})", font=dict(size=13)),
-            yaxis_title="Probability Density", xaxis_title="Settlement Price")
-        st.plotly_chart(fig_bell, use_container_width=True)
-
-        # PCR Trend sparkline
-        if len(st.session_state.pcr_history) > 1:
-            st.markdown("#### 📉 PCR Trend (Session)")
-            pcr_df = pd.DataFrame(st.session_state.pcr_history)
-            fig_pcr = go.Figure()
-            fig_pcr.add_trace(go.Scatter(x=pcr_df["time"], y=pcr_df["pcr"], mode="lines+markers",
-                line=dict(color="#3b82f6", width=2), marker=dict(size=4), name="PCR"))
-            fig_pcr.add_hline(y=1.0, line=dict(color="#64748b", dash="dash", width=1), annotation_text="Neutral")
-            fig_pcr.update_layout(**PLOTLY_LAYOUT, height=200,
-                yaxis_title="PCR", xaxis_title="Time")
-            st.plotly_chart(fig_pcr, use_container_width=True)
-
-        # OI Change summary
-        st.markdown("#### 🔄 OI Change (Current vs Previous)")
-        oc1, oc2 = st.columns(2)
-        with oc1:
-            top_ce_buildup = df.nlargest(5, "CE OI Chg")[["Strike", "CE OI", "CE OI Chg"]]
-            st.markdown("**Top Call OI Build-up**")
-            st.dataframe(top_ce_buildup.style.format({"Strike":"{:,.0f}","CE OI":"{:,.0f}","CE OI Chg":"{:+,.0f}"}),
-                         use_container_width=True, hide_index=True)
-        with oc2:
-            top_pe_buildup = df.nlargest(5, "PE OI Chg")[["Strike", "PE OI", "PE OI Chg"]]
-            st.markdown("**Top Put OI Build-up**")
-            st.dataframe(top_pe_buildup.style.format({"Strike":"{:,.0f}","PE OI":"{:,.0f}","PE OI Chg":"{:+,.0f}"}),
-                         use_container_width=True, hide_index=True)
-
-    # ──────────────────────────────────
-    #  TAB 2: OPTIONS CHAIN
-    # ──────────────────────────────────
-    with tab_chain:
-        st.markdown("#### Live Options Chain — Greeks & Market Data")
-
-        # Build a color-mapped HTML table for better visual density
-        display_cols = ["CE OI","CE OI Chg","CE Vol","CE IV","CE Delta","CE Theta","CE LTP",
-                        "Strike",
-                        "PE LTP","PE Theta","PE Delta","PE IV","PE Vol","PE OI Chg","PE OI"]
-        df_display = df[display_cols].copy()
-
-        def oi_bg(val, max_val):
-            if max_val == 0: return ""
-            intensity = min(abs(val)/max_val, 1.0)
-            return f"rgba(59,130,246,{intensity*0.25})"
-
-        def chg_color(val):
-            if val > 0: return "color: #4ade80;"
-            elif val < 0: return "color: #f87171;"
-            return ""
-
-        max_oi = max(df["CE OI"].max(), df["PE OI"].max(), 1)
-
-        def style_chain(row):
-            s = row["Strike"]
-            styles = [""] * len(row)
-            si = list(row.index)
-
-            # ATM highlight
-            if s == atm_strike:
-                styles = ["background-color: rgba(245,158,11,0.15); font-weight:700;"] * len(row)
-
-            # OI intensity on CE OI and PE OI columns
-            for col_name in ["CE OI", "PE OI"]:
-                idx = si.index(col_name)
-                intensity = min(abs(row[col_name])/max_oi, 1.0) if max_oi > 0 else 0
-                bg = f"rgba(59,130,246,{intensity*0.3})"
-                styles[idx] += f" background-color: {bg};"
-
-            # OI Change coloring
-            for col_name in ["CE OI Chg", "PE OI Chg"]:
-                idx = si.index(col_name)
-                v = row[col_name]
-                if v > 0:
-                    styles[idx] += " color: #4ade80;"
-                elif v < 0:
-                    styles[idx] += " color: #f87171;"
-
-            return styles
-
-        styled = df_display.style.apply(style_chain, axis=1).format({
-            "CE OI":"{:,.0f}", "CE OI Chg":"{:+,.0f}", "CE Vol":"{:,.0f}", "CE IV":"{:.1f}",
-            "CE Delta":"{:.3f}", "CE Theta":"{:.2f}", "CE LTP":"₹{:.2f}",
-            "Strike":"{:,.0f}",
-            "PE LTP":"₹{:.2f}", "PE Theta":"{:.2f}", "PE Delta":"{:.3f}", "PE IV":"{:.1f}",
-            "PE Vol":"{:,.0f}", "PE OI Chg":"{:+,.0f}", "PE OI":"{:,.0f}",
+    # Resample OHLCV
+    records = []
+    for i in range(0, len(df_1min) - (len(df_1min) % n), n):
+        chunk = df_1min.iloc[i : i + n]
+        records.append({
+            "timestamp": chunk["timestamp"].iloc[-1],
+            "open":      chunk["open"].iloc[0],
+            "high":      chunk["high"].max(),
+            "low":       chunk["low"].min(),
+            "close":     chunk["close"].iloc[-1],
+            "volume":    chunk["volume"].sum(),
+            "oi":        chunk["oi"].iloc[-1],
         })
-        st.dataframe(styled, use_container_width=True, height=500)
+    if not records or len(records) < MIN_RESAMPLED:
+        return pd.DataFrame()
 
-    # ──────────────────────────────────
-    #  TAB 3: STRATEGY BUILDER
-    # ──────────────────────────────────
-    with tab_strat:
-        st.markdown("#### 🛡️ Strategy Playbook")
+    df = pd.DataFrame(records).reset_index(drop=True)
 
-        # ── Smart Strategy Scoring Engine ──
-        adx_v = adx_metrics["adx"] if adx_metrics else 15
-        plus_di = adx_metrics["plus_di"] if adx_metrics else 0
-        minus_di = adx_metrics["minus_di"] if adx_metrics else 0
-        is_trending = adx_v > 25
-        is_bullish_trend = plus_di > minus_di
-        is_range_bound = adx_v < 20
-        spot_vs_maxpain = spot_price - max_pain  # positive = spot above max pain
-        spot_near_support = abs(spot_price - support) <= 2 * diff
-        spot_near_resistance = abs(spot_price - resistance) <= 2 * diff
+    # Compute EMA and RSI on the properly-sized resampled series
+    df["EMA_9"]  = ta.trend.ema_indicator(df["close"], window=9)
+    df["EMA_21"] = ta.trend.ema_indicator(df["close"], window=21)
+    df["RSI"]    = ta.momentum.rsi(df["close"], window=14)
 
-        # Score each strategy (higher = better fit for current conditions)
-        scores = {}
-        reasons = {}
+    return df
 
-        # ── Iron Condor ──
-        ic_score = 0
-        ic_why = []
-        if is_range_bound:
-            ic_score += 30
-            ic_why.append(f"ADX is {adx_v} (below 20) — market is range-bound, ideal for condors")
-        elif not is_trending:
-            ic_score += 15
-            ic_why.append(f"ADX is {adx_v} — no strong trend detected")
-        if 0.85 <= pcr <= 1.15:
-            ic_score += 20
-            ic_why.append(f"PCR is {pcr} — balanced put/call sentiment supports range expectation")
-        if 30 <= iv_pct <= 70:
-            ic_score += 15
-            ic_why.append(f"IV Percentile at {iv_pct:.0f}% — moderate, good for selling with wings")
-        elif iv_pct > 70:
-            ic_score += 10
-            ic_why.append(f"IV Percentile at {iv_pct:.0f}% — high IV boosts premium collected")
-        if tte_days <= 7:
-            ic_score += 10
-            ic_why.append(f"Only {tte_days:.1f} DTE — short expiry favors premium sellers")
-        if abs(spot_vs_maxpain) < 2 * diff:
-            ic_score += 10
-            ic_why.append(f"Spot is near Max Pain ({max_pain:,.0f}) — likely to stay pinned")
-        scores["Iron Condor"] = ic_score
-        reasons["Iron Condor"] = ic_why
 
-        # ── Short Straddle ──
-        ss_score = 0
-        ss_why = []
-        if is_range_bound:
-            ss_score += 25
-            ss_why.append(f"ADX at {adx_v} — range-bound market suits straddle selling")
-        if iv_pct > 60:
-            ss_score += 30
-            ss_why.append(f"IV Percentile at {iv_pct:.0f}% — elevated IV means fat premiums to collect")
-        elif iv_pct > 40:
-            ss_score += 10
-            ss_why.append(f"IV Percentile at {iv_pct:.0f}% — decent premium available")
-        if 0.90 <= pcr <= 1.10:
-            ss_score += 15
-            ss_why.append(f"PCR at {pcr} — very balanced, no directional pressure")
-        if tte_days <= 5:
-            ss_score += 15
-            ss_why.append(f"{tte_days:.1f} DTE — rapid theta decay maximizes straddle income")
-        if is_trending:
-            ss_score -= 20
-            ss_why.append(f"⚠️ ADX at {adx_v} — trending market is dangerous for naked straddles")
-        scores["Short Straddle"] = ss_score
-        reasons["Short Straddle"] = ss_why
 
-        # ── Iron Butterfly ──
-        ib_score = 0
-        ib_why = []
-        if iv_pct > 65:
-            ib_score += 30
-            ib_why.append(f"IV Percentile at {iv_pct:.0f}% — high IV is the butterfly's best friend")
-        if is_range_bound:
-            ib_score += 20
-            ib_why.append(f"ADX at {adx_v} — low trend strength supports pinning at ATM")
-        if abs(spot_vs_maxpain) < diff:
-            ib_score += 20
-            ib_why.append(f"Spot is very close to Max Pain ({max_pain:,.0f}) — high pin probability")
-        elif abs(spot_vs_maxpain) < 2 * diff:
-            ib_score += 10
-            ib_why.append(f"Spot is near Max Pain — moderate pin probability")
-        if tte_days <= 3:
-            ib_score += 15
-            ib_why.append(f"Only {tte_days:.1f} DTE — expiry-week pinning effect strongest now")
-        if is_trending:
-            ib_score -= 10
-            ib_why.append(f"⚠️ ADX at {adx_v} — trending market makes ATM pinning less likely")
-        scores["Iron Butterfly"] = ib_score
-        reasons["Iron Butterfly"] = ib_why
+def get_tf_data(token: str, interval: str, min_bars: int):
+    """
+    Fetch candles for a given interval. Returns (df, ok: bool).
 
-        # ── Bull Put Spread ──
-        bps_score = 0
-        bps_why = []
-        if pcr > 1.10:
-            bps_score += 25
-            bps_why.append(f"PCR at {pcr} — heavy put writing signals support below, bullish")
-        elif pcr > 1.0:
-            bps_score += 10
-            bps_why.append(f"PCR at {pcr} — slightly bullish lean")
-        if is_bullish_trend and is_trending:
-            bps_score += 25
-            bps_why.append(f"+DI ({plus_di}) > -DI ({minus_di}) with ADX {adx_v} — confirmed bullish trend")
-        elif is_bullish_trend:
-            bps_score += 10
-            bps_why.append(f"+DI ({plus_di}) > -DI ({minus_di}) — directional bias is upward")
-        if spot_price > max_pain:
-            bps_score += 10
-            bps_why.append(f"Spot ({spot_price:,.0f}) above Max Pain ({max_pain:,.0f}) — bullish positioning")
-        if spot_near_support:
-            bps_score += 15
-            bps_why.append(f"Spot near strong support at {support:,.0f} — low risk for put selling")
-        if iv_pct > 40:
-            bps_score += 5
-            bps_why.append(f"IV Percentile at {iv_pct:.0f}% — adequate premium for credit spread")
-        if pcr < 0.85:
-            bps_score -= 15
-            bps_why.append(f"⚠️ PCR at {pcr} — bearish OI skew argues against bullish bets")
-        scores["Bull Put Spread"] = bps_score
-        reasons["Bull Put Spread"] = bps_why
+    Upstox intraday  endpoint accepts: 1minute, 30minute only.
+    Upstox historical endpoint accepts: 1minute, 30minute, day, week, month.
 
-        # ── Bear Call Spread ──
-        bcs_score = 0
-        bcs_why = []
-        if pcr < 0.90:
-            bcs_score += 25
-            bcs_why.append(f"PCR at {pcr} — heavy call writing signals resistance above, bearish")
-        elif pcr < 1.0:
-            bcs_score += 10
-            bcs_why.append(f"PCR at {pcr} — slightly bearish lean")
-        if not is_bullish_trend and is_trending:
-            bcs_score += 25
-            bcs_why.append(f"-DI ({minus_di}) > +DI ({plus_di}) with ADX {adx_v} — confirmed bearish trend")
-        elif not is_bullish_trend:
-            bcs_score += 10
-            bcs_why.append(f"-DI ({minus_di}) > +DI ({plus_di}) — directional bias is downward")
-        if spot_price < max_pain:
-            bcs_score += 10
-            bcs_why.append(f"Spot ({spot_price:,.0f}) below Max Pain ({max_pain:,.0f}) — bearish positioning")
-        if spot_near_resistance:
-            bcs_score += 15
-            bcs_why.append(f"Spot near strong resistance at {resistance:,.0f} — ceiling likely to hold")
-        if iv_pct > 40:
-            bcs_score += 5
-            bcs_why.append(f"IV Percentile at {iv_pct:.0f}% — adequate premium for credit spread")
-        if pcr > 1.15:
-            bcs_score -= 15
-            bcs_why.append(f"⚠️ PCR at {pcr} — bullish OI skew argues against bearish bets")
-        scores["Bear Call Spread"] = bcs_score
-        reasons["Bear Call Spread"] = bcs_why
+    Mapping:
+      30minute (1H proxy) -> multi-day historical (30minute)
+      15minute            -> intraday 1minute, resampled x15
+      3minute             -> intraday 1minute, resampled x3
+      1minute             -> intraday 1minute directly
+    """
+    if interval == "30minute":
+        df = fetch_historical_candles_multi_day(
+            token, "NSE_INDEX|Nifty 50", interval="30minute", days_back=60
+        )
+    elif interval == "15minute":
+        raw = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval="1minute")
+        df  = resample_candles(raw, 15)
+    elif interval == "3minute":
+        raw = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval="1minute")
+        df  = resample_candles(raw, 3)
+    else:
+        df = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval=interval)
 
-        # ── Rank strategies ──
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        best_name, best_score = ranked[0]
-        second_name, second_score = ranked[1]
-
-        # Strategy icons and colors
-        strat_meta = {
-            "Iron Condor":     {"icon": "📊", "color": "#3b82f6", "risk": "Defined", "type": "Neutral"},
-            "Short Straddle":  {"icon": "🔥", "color": "#f59e0b", "risk": "Unlimited", "type": "Neutral"},
-            "Iron Butterfly":  {"icon": "🦋", "color": "#8b5cf6", "risk": "Defined", "type": "Neutral"},
-            "Bull Put Spread": {"icon": "📈", "color": "#22c55e", "risk": "Defined", "type": "Bullish"},
-            "Bear Call Spread":{"icon": "📉", "color": "#ef4444", "risk": "Defined", "type": "Bearish"},
+    if df.empty or len(df) < min_bars:
+        return pd.DataFrame(), False
+    return df, True
+def build_1h_trend(token: str) -> dict:
+    """
+    30-Minute bars used as 1H proxy (Upstox historical API supports 30minute, not 60minute).
+    104 bars = ~52 trading hours of context.
+    Trend LAYER.
+    Determines overall market direction.
+    Indicators: EMA 20/50 state, Supertrend only. No ADX — direction is enough here.
+    Returns dict of filter states + direction (+1 bull, -1 bear, 0 neutral).
+    """
+    df, ok = get_tf_data(token, "30minute", 104)
+    # Store bar count for debug display in filter panel
+    st.session_state["_debug_1h_bars"] = list(range(len(df))) if not df.empty else []
+    if not ok:
+        return {
+            "ok": False, "direction": 0, "filters": {},
+            "debug": f"{len(df)} bars received (need 104 × 30min bars = ~52 hours of context)",
         }
 
-        bm = strat_meta[best_name]
-        best_reasons_html = "".join(
-            f'<div style="font-size:13px; color:#e2e8f0; line-height:1.7; padding:2px 0;">✓ {r}</div>'
-            for r in reasons[best_name]
-        )
+    df["EMA_20"] = ta.trend.ema_indicator(df["close"], window=40)   # 40×30min ≈ 20×1H
+    df["EMA_50"] = ta.trend.ema_indicator(df["close"], window=100)  # 100×30min ≈ 50×1H
+    df["ST"]     = compute_supertrend(df, length=14, multiplier=3.0)  # scaled for 30min
 
-        # Confidence label
-        if best_score >= 60:
-            conf_label = "HIGH CONFIDENCE"
-            conf_color = "#4ade80"
-        elif best_score >= 40:
-            conf_label = "MODERATE CONFIDENCE"
-            conf_color = "#fbbf24"
+    last = df.iloc[-1]
+    ema_bull = float(last["EMA_20"]) > float(last["EMA_50"])
+    ema_bear = float(last["EMA_20"]) < float(last["EMA_50"])
+    st_bull  = int(last["ST"]) == 1
+    st_bear  = int(last["ST"]) == -1
+
+    if ema_bull and st_bull:
+        direction = 1
+    elif ema_bear and st_bear:
+        direction = -1
+    else:
+        direction = 0
+
+    # Only show filters relevant to the detected direction
+    if direction == 1:
+        filters = {
+            "EMA 20 > EMA 50": ema_bull,
+            "Supertrend bull":  st_bull,
+        }
+    elif direction == -1:
+        filters = {
+            "EMA 20 < EMA 50": ema_bear,
+            "Supertrend bear":  st_bear,
+        }
+    else:
+        # Neutral — show why both directions failed
+        filters = {
+            "EMA 20 > EMA 50 (bull need)": ema_bull,
+            "Supertrend bull (bull need)":  st_bull,
+            "EMA 20 < EMA 50 (bear need)":  ema_bear,
+            "Supertrend bear (bear need)":  st_bear,
+        }
+    return {
+        "ok": True, "direction": direction, "filters": filters,
+        "ema20": float(last["EMA_20"]), "ema50": float(last["EMA_50"]),
+        "st": int(last["ST"]), "close": float(last["close"]),
+    }
+
+
+def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -> dict:
+    """
+    15-Minute timeframe — MOMENTUM LAYER.
+    Confirms the 1H trend has momentum behind it.
+    Indicators: EMA 9/21 state, RSI 14, VWAP side, OI/PCR.
+    Only evaluated when 1H direction is non-zero.
+    """
+    # Fetch 1min bars. Need 330+ for accurate 15M resampling (22 bars × 15min).
+    # With fewer bars, use 1min indicators directly — less accurate but valid.
+    df_1min, ok_1min = get_tf_data(token, "1minute", 20)
+    if not ok_1min:
+        return {"ok": False, "confirmed": False, "filters": {}, "bars": 0}
+
+    df_15m = build_resampled_indicators(df_1min, 15)
+
+    if df_15m.empty:
+        # Not enough bars for proper 15M — use 1min series with standard windows
+        # This is used early session (<5.5 hrs elapsed) only
+        df_work = df_1min.copy()
+        df_work["EMA_9"]  = ta.trend.ema_indicator(df_work["close"], window=9)
+        df_work["EMA_21"] = ta.trend.ema_indicator(df_work["close"], window=21)
+        df_work["RSI"]    = ta.momentum.rsi(df_work["close"], window=14)
+        df_work = df_work.dropna(subset=["EMA_9", "EMA_21", "RSI"])
+        if df_work.empty:
+            return {"ok": False, "confirmed": False, "filters": {}, "bars": len(df_1min)}
+        df_15m = df_work   # use 1min as proxy — note in panel
+        using_proxy = True
+    else:
+        using_proxy = False
+
+    last = df_15m.iloc[-1]
+    ema_state_bull = float(last["EMA_9"]) > float(last["EMA_21"])
+    ema_state_bear = float(last["EMA_9"]) < float(last["EMA_21"])
+    rsi_val        = float(last["RSI"])
+    rsi_mid_bull   = 45 < rsi_val < 75  # 45 floor accounts for 1min proxy underestimation
+    rsi_mid_bear   = 25 < rsi_val < 55  # 55 ceiling accounts for 1min proxy overestimation
+    close_15m      = float(last["close"])
+    above_vwap     = close_15m > vwap_value
+    below_vwap     = close_15m < vwap_value
+
+    # OI gate — bypassed if API unavailable
+    if oi.get("oi_available", False):
+        oi_ok_call = oi["oi_surge_ce"] or (oi["pcr"] > 1.0)
+        oi_ok_put  = oi["oi_surge_pe"] or (oi["pcr"] < 1.0)
+    else:
+        oi_ok_call = True
+        oi_ok_put  = True
+
+    if trend_dir == 1:
+        confirmed = ema_state_bull and rsi_mid_bull and above_vwap and oi_ok_call
+        filters = {
+            "EMA 9>21 (bull state)": ema_state_bull,
+            "RSI 45–75":             rsi_mid_bull,
+            "Price > VWAP":          above_vwap,
+            "OI/PCR confirms call":  oi_ok_call,
+        }
+    elif trend_dir == -1:
+        confirmed = ema_state_bear and rsi_mid_bear and below_vwap and oi_ok_put
+        filters = {
+            "EMA 9<21 (bear state)": ema_state_bear,
+            "RSI 25–55":             rsi_mid_bear,
+            "Price < VWAP":          below_vwap,
+            "OI/PCR confirms put":   oi_ok_put,
+        }
+    else:
+        confirmed = False
+        filters = {"No trend on 1H": False}
+
+    return {
+        "ok": True, "confirmed": confirmed, "filters": filters,
+        "ema9": float(last["EMA_9"]), "ema21": float(last["EMA_21"]),
+        "rsi": rsi_val, "close": close_15m,
+        "vwap": vwap_value,
+        "pcr": oi.get("pcr", 0),
+        "oi_available": oi.get("oi_available", False),
+        "bars": len(df_15m) if not df_15m.empty else 0,
+        "proxy": using_proxy,
+    }
+
+
+def build_3m_trigger(token: str, trend_dir: int) -> dict:
+    """
+    3-Minute timeframe — ENTRY TRIGGER LAYER.
+    Fine-tunes exact entry timing. Only evaluated when 1H + 15M agree.
+    Indicators: EMA 9/21 state, RSI slope, volume surge, ADX > 20.
+    ADX here confirms the 3M move has real momentum — not just a random wiggle.
+    Uses STATE not crossover — avoids the timing coincidence problem entirely.
+    """
+    # Fetch 1min bars and resample to proper 3M OHLCV, then compute indicators
+    df_1min_3m, ok_1min_3m = get_tf_data(token, "1minute", 30)
+    if not ok_1min_3m:
+        return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
+
+    df = build_resampled_indicators(df_1min_3m, 3)
+    if len(df) < 2:
+        return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
+
+    # ADX needs at least (2 × window + 1) bars — only compute if enough exist
+    adx_window = 7
+    if len(df) >= adx_window * 2 + 1:
+        df["ADX"] = ta.trend.adx(df["high"], df["low"], df["close"], window=adx_window)
+        adx_val   = float(df["ADX"].dropna().iloc[-1]) if not df["ADX"].dropna().empty else 25.0
+    else:
+        adx_val = 25.0   # assume trending when not enough bars
+
+    # Bar range expansion — proxy for volume surge on index instruments
+    # (NSE_INDEX volume is always 0; candle range expansion signals momentum)
+    df["Bar_Range"]     = df["high"] - df["low"]
+    df["Bar_Range_SMA"] = df["Bar_Range"].rolling(window=min(10, len(df))).mean()
+    df = df.dropna(subset=["Bar_Range_SMA"]).reset_index(drop=True)
+    if len(df) < 2:
+        return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    ema_state_bull = float(last["EMA_9"]) > float(last["EMA_21"])
+    ema_state_bear = float(last["EMA_9"]) < float(last["EMA_21"])
+    rsi_now        = float(last["RSI"])
+    rsi_prev       = float(prev["RSI"])
+    rsi_rising     = rsi_now > rsi_prev and 45 < rsi_now < 78
+    rsi_falling    = rsi_now < rsi_prev and 22 < rsi_now < 55
+    # Range expansion: current bar range > 10-bar average range (momentum proxy)
+    range_expand   = float(last["Bar_Range"]) > float(last["Bar_Range_SMA"])
+    adx_strong     = adx_val > 20
+
+    if trend_dir == 1:
+        triggered = ema_state_bull and rsi_rising and range_expand and adx_strong
+        filters = {
+            "EMA 9>21 (bull state)":   ema_state_bull,
+            "RSI rising 45–78":        rsi_rising,
+            "Range expansion":         range_expand,
+            "ADX > 20 (momentum)":     adx_strong,
+        }
+    elif trend_dir == -1:
+        triggered = ema_state_bear and rsi_falling and range_expand and adx_strong
+        filters = {
+            "EMA 9<21 (bear state)":   ema_state_bear,
+            "RSI falling 22–55":       rsi_falling,
+            "Range expansion":         range_expand,
+            "ADX > 20 (momentum)":     adx_strong,
+        }
+    else:
+        triggered = False
+        filters = {"No trend direction": False}
+
+    return {
+        "ok": True, "triggered": triggered, "filters": filters,
+        "ema9":     float(last["EMA_9"]),
+        "ema21":    float(last["EMA_21"]),
+        "rsi":      rsi_now,
+        "rsi_prev": rsi_prev,
+        "adx":      adx_val,
+        "range":     float(last["Bar_Range"]),
+        "range_sma": float(last["Bar_Range_SMA"]) if not pd.isna(last["Bar_Range_SMA"]) else 0.0,
+        "df":       df,
+    }
+
+
+def evaluate_mtf_signal(token: str, vwap_value: float, oi: dict) -> tuple:
+    """
+    Master MTF evaluator. Runs all three timeframe layers in sequence.
+    Returns (signal: str, tf_data: dict) where signal is 'call'/'put'/'none'.
+    tf_data carries all filter states for the dashboard status panel.
+    Short-circuits: if 1H is neutral, 15M and 3M are not fetched.
+    """
+    tf = {}
+
+    # ── Layer 1: 1H Trend ────────────────────────────────────────────────────
+    tf["1h"] = build_1h_trend(token)
+    trend_dir = tf["1h"].get("direction", 0)
+
+    if trend_dir == 0:
+        tf["15m"] = {"ok": False, "confirmed": False, "filters": {"Waiting for 1H trend": False}}
+        tf["3m"]  = {"ok": False, "triggered": False, "filters": {"Waiting for 1H trend": False}, "df": pd.DataFrame()}
+        return "none", tf
+
+    # ── Layer 2: 15M Momentum ────────────────────────────────────────────────
+    tf["15m"] = build_15m_confirm(token, trend_dir, vwap_value, oi)
+    if not tf["15m"]["confirmed"]:
+        tf["3m"] = {"ok": False, "triggered": False, "filters": {"Waiting for 15M confirm": False}, "df": pd.DataFrame()}
+        return "none", tf
+
+    # ── Layer 3: 3M Trigger ──────────────────────────────────────────────────
+    tf["3m"] = build_3m_trigger(token, trend_dir)
+    if not tf["3m"]["triggered"]:
+        return "none", tf
+
+    signal = "call" if trend_dir == 1 else "put"
+    return signal, tf
+
+
+# ==============================================================================
+# SESSION STATE BOOTSTRAP
+# ==============================================================================
+st.set_page_config(page_title="Upstox Algo Scalper", layout="wide")
+
+defaults = {
+    "bot_active":       False,
+    "current_position": None,
+    "trade_logs":       [],
+    "session_pnl":      0.0,
+    "loss_streak":      0,
+    "oi_snapshot":      {},
+    "oi_history":       [],
+    "order_log":        [],
+    "api_last_call":    {},
+    "api_errors":       [],
+    "last_tf_data":     {},
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── Bust stale cache keys from old invalid interval calls ─────────────────────
+# Previous versions called 15minute and 3minute directly against the Upstox
+# intraday endpoint which rejects them. Clear any cached failures so the new
+# resample-based approach starts fresh on every app load.
+for _stale_key in ["_candle_cache_15minute", "_candle_cache_3minute"]:
+    if _stale_key in st.session_state:
+        del st.session_state[_stale_key]
+
+# Clear API errors older than today to avoid confusing stale errors in the log
+_today_str = now_ist().strftime("%H")   # clear if new session hour
+if st.session_state.get("_error_log_hour") != _today_str:
+    st.session_state["api_errors"]     = []
+    st.session_state["_error_log_hour"] = _today_str
+
+# SESSION STATE BOOTSTRAP
+# ==============================================================================
+st.set_page_config(page_title="Upstox Algo Scalper", layout="wide")
+
+defaults = {
+    "bot_active":          False,
+    "current_position":    None,
+    "trade_logs":          [],
+    "session_pnl":         0.0,
+    "loss_streak":         0,
+    "oi_snapshot":         {},
+    "oi_history":          [],
+    "order_log":           [],
+    "api_last_call":       {},
+    "api_errors":          [],
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── Bust stale cache keys from old invalid interval calls ─────────────────────
+# Previous versions called 15minute and 3minute directly against the Upstox
+# intraday endpoint which rejects them. Clear any cached failures so the new
+# resample-based approach starts fresh on every app load.
+for _stale_key in ["_candle_cache_15minute", "_candle_cache_3minute"]:
+    if _stale_key in st.session_state:
+        del st.session_state[_stale_key]
+
+# Clear API errors older than today to avoid confusing stale errors in the log
+_today_str = now_ist().strftime("%H")   # clear if new session hour
+if st.session_state.get("_error_log_hour") != _today_str:
+    st.session_state["api_errors"]     = []
+    st.session_state["_error_log_hour"] = _today_str
+
+# ==============================================================================
+# SIDEBAR
+# ==============================================================================
+st.sidebar.header("🔌 Authentication")
+ACCESS_TOKEN = st.sidebar.text_input(
+    "Upstox Access Token", type="password",
+    help="Expires midnight IST — generate fresh each trading day.",
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Strategy Parameters")
+INITIAL_CAPITAL = st.sidebar.number_input("Starting Capital (₹)", value=50_000, step=5_000)
+STOP_LOSS_PCT   = st.sidebar.slider("Stop Loss % (ATR fallback)", 1, 10, DEFAULT_STOP_LOSS_PCT) / 100.0
+TARGET_PCT      = st.sidebar.slider("Target % (ATR fallback)",   1, 25, DEFAULT_TARGET_PCT)    / 100.0
+ATR_MULTIPLIER  = st.sidebar.slider("ATR SL Multiplier", 1.0, 3.0, 1.5, step=0.1)
+RR_MIN          = st.sidebar.slider("Min Risk:Reward",   1.0, 4.0, float(DEFAULT_RR_MIN), step=0.1)
+LOT_SIZE        = st.sidebar.number_input("Lot Size", value=NIFTY_LOT_SIZE, min_value=1, step=1)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🛡️ Risk Guardrails")
+MAX_DAILY_LOSS = st.sidebar.number_input("Daily Loss Limit (₹)", value=DEFAULT_MAX_DAILY_LOSS,
+                                          step=500, min_value=500)
+MAX_TRADES     = st.sidebar.number_input("Max Trades / Day", value=DEFAULT_MAX_TRADES,
+                                          step=1, min_value=1)
+
+st.sidebar.markdown("---")
+TRADE_MODE = st.sidebar.radio(
+    "🎯 Execution Mode",
+    ["📄 Paper Trading (Simulated)", "⚡ Live Trading (Real Money)"],
+)
+IS_PAPER = "Paper" in TRADE_MODE
+
+st.sidebar.markdown("---")
+st.sidebar.caption(f"⚡ Circuit breaker after **{MAX_LOSS_STREAK}** consecutive losses")
+st.sidebar.caption(f"📊 OI surge threshold: **{OI_SURGE_RATIO}×** 5-bar avg")
+st.sidebar.caption(f"💸 Slippage: ₹{SLIPPAGE_PER_SIDE}/unit/side")
+st.sidebar.caption(f"🕐 Server IST: **{ist_time_str()}**")
+
+current_capital = INITIAL_CAPITAL + st.session_state.session_pnl
+
+if ACCESS_TOKEN and "instrument_master" not in st.session_state:
+    with st.sidebar:
+        with st.spinner("Loading instrument master…"):
+            load_instrument_master()
+
+# ==============================================================================
+# MAIN DASHBOARD
+# ==============================================================================
+st.title("🦅 Upstox Options Advanced Scalping Engine")
+
+# ── Row 1: KPI Metrics ────────────────────────────────────────────────────────
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+nifty_spot  = fetch_ltp(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") if ACCESS_TOKEN else None
+trade_count = len(st.session_state.trade_logs)
+
+m1.metric("📊 Nifty Spot",   f"₹{nifty_spot:,.2f}" if nifty_spot else "—")
+m2.metric("💰 Balance",      f"₹{current_capital:,.2f}")
+m3.metric("📈 Session PnL",  f"₹{st.session_state.session_pnl:,.2f}",
+          delta=f"{(st.session_state.session_pnl/INITIAL_CAPITAL*100):.2f}%" if INITIAL_CAPITAL else "0%")
+m4.metric("🛡️ Mode",         "LIVE" if not IS_PAPER else "PAPER")
+m5.metric("🔴 Loss Streak",  f"{st.session_state.loss_streak} / {MAX_LOSS_STREAK}",
+          delta="⚠️ At limit!" if st.session_state.loss_streak >= MAX_LOSS_STREAK - 1 else None)
+m6.metric("📋 Trades Today", f"{trade_count} / {MAX_TRADES}",
+          delta="⚠️ Near limit!" if trade_count >= MAX_TRADES - 1 else None)
+
+# ── Session window banner ──────────────────────────────────────────────────────
+if in_prime_session():
+    st.success(f"🟢 **Prime Session Active** ({ist_time_str()}) — scanning for entries")
+else:
+    st.warning(f"🕐 **Outside Prime Window** ({ist_time_str()}) — next: {next_window_str()}")
+
+# ── Pending signal indicator ───────────────────────────────────────────────────
+pending = st.session_state.get("pending_signal", "none")
+if pending != "none":
+    bars  = st.session_state.get("pending_signal_bars", 0)
+    dlbl  = "📈 CALL" if pending == "call" else "📉 PUT"
+    st.info(f"⏳ **Stage 1 latched: {dlbl}** — confirming "
+            f"({bars}/{SIGNAL_HOLD_BARS} bars confirmed)")
+
+st.markdown("---")
+
+# ── Row 2: Controls | OI | Position ──────────────────────────────────────────
+col_ctrl, col_oi, col_pos = st.columns([1, 1, 2])
+
+with col_ctrl:
+    st.subheader("🕹️ Engine Controls")
+    if not ACCESS_TOKEN:
+        st.warning("Provide an Upstox Access Token to activate.")
+    else:
+        if not st.session_state.bot_active:
+            if st.button("▶️ START BOT", type="primary", width='stretch'):
+                st.session_state.bot_active          = True
+                st.session_state.loss_streak         = 0
+                st.session_state.pending_signal      = "none"
+                st.session_state.pending_signal_bars = 0
+                st.rerun()
         else:
-            conf_label = "LOW CONFIDENCE"
-            conf_color = "#f87171"
+            if st.button("🛑 EMERGENCY HALT", type="secondary", width='stretch'):
+                if st.session_state.current_position and not IS_PAPER:
+                    pos     = st.session_state.current_position
+                    ltp_now = fetch_ltp(ACCESS_TOKEN, pos["key"]) or pos["entry_price"]
+                    exit_position(ACCESS_TOKEN, pos, ltp_now, "MANUAL HALT 🛑", IS_PAPER, LOT_SIZE)
+                st.session_state.bot_active       = False
+                st.session_state.current_position = None
+                st.rerun()
 
-        st.markdown(f"""
-        <div style="border:2px solid {bm['color']}; border-radius:12px; padding:20px; margin:8px 0 16px 0;
-                    background:rgba(17,24,39,0.8);">
-            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
-                <div style="display:flex; align-items:center; gap:10px;">
-                    <span style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:2px; font-weight:600;">
-                        Recommended Strategy
-                    </span>
-                </div>
-                <span style="font-size:10px; font-weight:700; color:{conf_color};
-                             background:rgba(0,0,0,0.3); padding:3px 10px; border-radius:4px;
-                             letter-spacing:1.5px;">
-                    {conf_label}
-                </span>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">
-                <span style="font-size:32px;">{bm['icon']}</span>
-                <div>
-                    <div style="font-size:22px; font-weight:800; color:#ffffff; font-family:'JetBrains Mono',monospace;">
-                        {best_name}
-                    </div>
-                    <div style="font-size:12px; color:#94a3b8; margin-top:2px;">
-                        {bm['type']} · {bm['risk']} Risk · Score: {best_score}/100
-                    </div>
-                </div>
-            </div>
-            <div style="border-top:1px solid #1e293b; padding-top:12px; margin-top:4px;">
-                <div style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; font-weight:600; margin-bottom:8px;">
-                    Why This Strategy Now
-                </div>
-                {best_reasons_html}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        status = "🟢 Active" if st.session_state.bot_active else "🔴 Inactive"
+        st.info(f"State: **{status}**")
 
-        # Show runner-up as a smaller card
-        sm = strat_meta[second_name]
-        second_reasons_short = reasons[second_name][:2]
-        second_reasons_html = "".join(
-            f'<span style="font-size:11px; color:#94a3b8;">✓ {r}</span><br>'
-            for r in second_reasons_short
+        if st.session_state.trade_logs:
+            csv_bytes = pd.DataFrame(st.session_state.trade_logs).to_csv(index=False).encode()
+            st.download_button("📥 Trade Log (CSV)", data=csv_bytes,
+                               file_name=f"scalper_{now_ist().date()}.csv",
+                               mime="text/csv", width='stretch')
+
+with col_oi:
+    st.subheader("\U0001f4ca OI Intelligence")
+
+    if ACCESS_TOKEN:
+        _spot_for_oi = nifty_spot if nifty_spot else 24000.0
+        # Get expiry directly from Upstox
+        _expiry_str = get_active_expiry_from_upstox(ACCESS_TOKEN)
+
+        _oi_url = _build_url(
+            f"{UPSTOX_BASE_URL}/option/chain",
+            {"instrument_key": "NSE_INDEX|Nifty 50", "expiry_date": _expiry_str}
         )
-        st.markdown(f"""
-        <div style="border:1px solid #1e293b; border-radius:8px; padding:12px 16px; margin:0 0 16px 0;
-                    background:rgba(17,24,39,0.5); display:flex; align-items:center; gap:14px;">
-            <span style="font-size:20px;">{sm['icon']}</span>
-            <div style="flex:1;">
-                <div style="font-size:13px; font-weight:700; color:#cbd5e1;">
-                    Runner-up: {second_name}
-                    <span style="font-size:11px; color:#64748b; font-weight:400; margin-left:6px;">
-                        Score: {second_score}/100
-                    </span>
-                </div>
-                {second_reasons_html}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
 
-        # Strategy selector — user still picks
-        strat_choice = st.selectbox("Select Strategy", ["Iron Condor", "Short Straddle", "Iron Butterfly", "Bull Put Spread", "Bear Call Spread"])
+        with st.expander("\U0001f50d OI Diagnostic", expanded=not bool(st.session_state.get("oi_snapshot"))):
+            st.caption(f"Spot ref: \u20b9{_spot_for_oi:,.0f} | Expiry: **{_expiry_str}**")
+            st.code(_oi_url, language="text")
+            if st.button("\U0001f504 Force Refresh OI", width='stretch'):
+                st.session_state.oi_snapshot = {}
+                st.session_state.oi_history  = []
+                st.rerun()
+            _errs = [e for e in st.session_state.get("api_errors", [])
+                     if "option" in e.get("endpoint", "")]
+            if _errs:
+                _e = _errs[-1]
+                st.error(f"Last error {_e['time']} — HTTP {_e['status']}: {_e['body']}")
+            else:
+                st.success("No OI API errors logged.")
 
-        def get_ltp(strike):
-            """
-            Look up CE & PE LTP for a strike with 3-tier fallback:
-            1. Live LTP from batch API call (already fetched at load time)
-            2. Chain DataFrame LTP
-            3. Black-Scholes theoretical price (last resort, marked with '(theo)')
-            """
-            ce_ltp = live_ltp_map.get((strike, "CE"), 0.0)
-            pe_ltp = live_ltp_map.get((strike, "PE"), 0.0)
-
-            # Fallback to chain DataFrame
-            if ce_ltp == 0 or pe_ltp == 0:
-                m = df[df["Strike"] == strike]
-                if not m.empty:
-                    if ce_ltp == 0:
-                        ce_ltp = float(m.iloc[0]["CE LTP"])
-                    if pe_ltp == 0:
-                        pe_ltp = float(m.iloc[0]["PE LTP"])
-
-            # Last resort: BS theoretical price using live ATM IV
-            if ce_ltp == 0:
-                ce_ltp = bs_greeks(spot_price, strike, tte_years, risk_free_rate, iv_for_sigma, "CE")["price"]
-            if pe_ltp == 0:
-                pe_ltp = bs_greeks(spot_price, strike, tte_years, risk_free_rate, iv_for_sigma, "PE")["price"]
-
-            return ce_ltp, pe_ltp
-
-        def price_source_label(strike, opt_type):
-            """Returns a label indicating price source."""
-            if live_ltp_map.get((strike, opt_type), 0) > 0:
-                return ""  # Live — no label needed
-            m = df[df["Strike"] == strike]
-            if not m.empty:
-                col = "CE LTP" if opt_type == "CE" else "PE LTP"
-                if float(m.iloc[0][col]) > 0:
-                    return ""  # Chain — no label needed
-            return " <span style='font-size:10px; color:#94a3b8;'>(theo)</span>"
-
-        legs = []
-
-        if strat_choice == "Iron Condor":
-            c_sell_ce, _ = get_ltp(ic_sell_call)
-            _, p_sell_pe = get_ltp(ic_sell_put)
-            c_buy_ce, _ = get_ltp(ic_buy_call)
-            _, p_buy_pe = get_ltp(ic_buy_put)
-            net = max((c_sell_ce + p_sell_pe) - (c_buy_ce + p_buy_pe), 0)
-            max_risk = diff - net if net > 0 else diff
-            legs = [
-                {"strike":ic_buy_put,"type":"PE","action":"BUY","premium":p_buy_pe},
-                {"strike":ic_sell_put,"type":"PE","action":"SELL","premium":p_sell_pe},
-                {"strike":ic_sell_call,"type":"CE","action":"SELL","premium":c_sell_ce},
-                {"strike":ic_buy_call,"type":"CE","action":"BUY","premium":c_buy_ce},
-            ]
-            st.markdown(f"""
-            <div class="strat-card">
-                <div class="strat-title" style="color:#3b82f6;">📊 Iron Condor</div>
-                <div class="strat-leg">
-                    BUY 1× <b>{ic_buy_put} PE</b> @ ₹{p_buy_pe:.2f}{price_source_label(ic_buy_put, "PE")}<br>
-                    SELL 1× <b>{ic_sell_put} PE</b> @ ₹{p_sell_pe:.2f}{price_source_label(ic_sell_put, "PE")}<br>
-                    SELL 1× <b>{ic_sell_call} CE</b> @ ₹{c_sell_ce:.2f}{price_source_label(ic_sell_call, "CE")}<br>
-                    BUY 1× <b>{ic_buy_call} CE</b> @ ₹{c_buy_ce:.2f}{price_source_label(ic_buy_call, "CE")}
-                </div>
-                <div class="strat-profit" style="color:#4ade80;">
-                    💰 Net Credit: ₹{net:,.2f}/lot &nbsp;(₹{net*lot_size:,.0f} total)
-                </div>
-                <div style="color:#fca5a5; font-size:14px; margin-top:6px; font-weight:700;">
-                    ⚠️ Max Risk: ₹{max_risk:,.2f}/lot &nbsp;(₹{max_risk*lot_size:,.0f} total)
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        elif strat_choice == "Short Straddle":
-            c_atm, p_atm = get_ltp(atm_strike)
-            net = c_atm + p_atm
-            upper_be = atm_strike + net
-            lower_be = atm_strike - net
-            legs = [
-                {"strike":atm_strike,"type":"CE","action":"SELL","premium":c_atm},
-                {"strike":atm_strike,"type":"PE","action":"SELL","premium":p_atm},
-            ]
-            st.markdown(f"""
-            <div class="strat-card">
-                <div class="strat-title" style="color:#f59e0b;">🔥 Short Straddle</div>
-                <div class="strat-leg">
-                    SELL 1× <b>{atm_strike} CE</b> @ ₹{c_atm:.2f}{price_source_label(atm_strike, "CE")}<br>
-                    SELL 1× <b>{atm_strike} PE</b> @ ₹{p_atm:.2f}{price_source_label(atm_strike, "PE")}
-                </div>
-                <div class="strat-profit" style="color:#4ade80;">
-                    💰 Net Credit: ₹{net:,.2f}/lot &nbsp;(₹{net*lot_size:,.0f} total)
-                </div>
-                <div style="font-size:14px; color:#e2e8f0; margin-top:6px; font-weight:600;">
-                    Breakevens: ₹{lower_be:,.0f} – ₹{upper_be:,.0f} &nbsp;⚠️ Unlimited risk
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        elif strat_choice == "Iron Butterfly":
-            c_atm, p_atm = get_ltp(atm_strike)
-            c_buy_ce, _ = get_ltp(ic_buy_call)
-            _, p_buy_pe = get_ltp(ic_buy_put)
-            net = max((c_atm + p_atm) - (c_buy_ce + p_buy_pe), 0)
-            legs = [
-                {"strike":ic_buy_put,"type":"PE","action":"BUY","premium":p_buy_pe},
-                {"strike":atm_strike,"type":"PE","action":"SELL","premium":p_atm},
-                {"strike":atm_strike,"type":"CE","action":"SELL","premium":c_atm},
-                {"strike":ic_buy_call,"type":"CE","action":"BUY","premium":c_buy_ce},
-            ]
-            st.markdown(f"""
-            <div class="strat-card">
-                <div class="strat-title" style="color:#8b5cf6;">🦋 Iron Butterfly</div>
-                <div class="strat-leg">
-                    BUY 1× <b>{ic_buy_put} PE</b> @ ₹{p_buy_pe:.2f}{price_source_label(ic_buy_put, "PE")}<br>
-                    SELL 1× <b>{atm_strike} PE</b> @ ₹{p_atm:.2f}{price_source_label(atm_strike, "PE")}<br>
-                    SELL 1× <b>{atm_strike} CE</b> @ ₹{c_atm:.2f}{price_source_label(atm_strike, "CE")}<br>
-                    BUY 1× <b>{ic_buy_call} CE</b> @ ₹{c_buy_ce:.2f}{price_source_label(ic_buy_call, "CE")}
-                </div>
-                <div class="strat-profit" style="color:#4ade80;">
-                    💰 Net Credit: ₹{net:,.2f}/lot &nbsp;(₹{net*lot_size:,.0f} total)
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        elif strat_choice == "Bull Put Spread":
-            sell_strike = ic_sell_put
-            buy_strike = ic_buy_put
-            _, p_sell = get_ltp(sell_strike)
-            _, p_buy = get_ltp(buy_strike)
-            net = max(p_sell - p_buy, 0)
-            max_risk = diff - net
-            legs = [
-                {"strike":buy_strike,"type":"PE","action":"BUY","premium":p_buy},
-                {"strike":sell_strike,"type":"PE","action":"SELL","premium":p_sell},
-            ]
-            st.markdown(f"""
-            <div class="strat-card">
-                <div class="strat-title" style="color:#22c55e;">📈 Bull Put Spread</div>
-                <div class="strat-leg">
-                    SELL 1× <b>{sell_strike} PE</b> @ ₹{p_sell:.2f}{price_source_label(sell_strike, "PE")}<br>
-                    BUY 1× <b>{buy_strike} PE</b> @ ₹{p_buy:.2f}{price_source_label(buy_strike, "PE")}
-                </div>
-                <div class="strat-profit" style="color:#4ade80;">
-                    💰 Net Credit: ₹{net:,.2f}/lot &nbsp;(₹{net*lot_size:,.0f} total)
-                </div>
-                <div style="color:#fca5a5; font-size:14px; margin-top:6px; font-weight:700;">
-                    ⚠️ Max Risk: ₹{max_risk:,.2f}/lot
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        elif strat_choice == "Bear Call Spread":
-            sell_strike = ic_sell_call
-            buy_strike = ic_buy_call
-            c_sell, _ = get_ltp(sell_strike)
-            c_buy, _ = get_ltp(buy_strike)
-            net = max(c_sell - c_buy, 0)
-            max_risk = diff - net
-            legs = [
-                {"strike":sell_strike,"type":"CE","action":"SELL","premium":c_sell},
-                {"strike":buy_strike,"type":"CE","action":"BUY","premium":c_buy},
-            ]
-            st.markdown(f"""
-            <div class="strat-card">
-                <div class="strat-title" style="color:#ef4444;">📉 Bear Call Spread</div>
-                <div class="strat-leg">
-                    SELL 1× <b>{sell_strike} CE</b> @ ₹{c_sell:.2f}{price_source_label(sell_strike, "CE")}<br>
-                    BUY 1× <b>{buy_strike} CE</b> @ ₹{c_buy:.2f}{price_source_label(buy_strike, "CE")}
-                </div>
-                <div class="strat-profit" style="color:#4ade80;">
-                    💰 Net Credit: ₹{net:,.2f}/lot &nbsp;(₹{net*lot_size:,.0f} total)
-                </div>
-                <div style="color:#fca5a5; font-size:14px; margin-top:6px; font-weight:700;">
-                    ⚠️ Max Risk: ₹{max_risk:,.2f}/lot
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        # ── P&L Heatmap ──
-        if legs:
-            st.markdown("#### 🗺️ P&L Heatmap — What You Make or Lose")
-            st.caption("Each cell shows your total profit (green) or loss (red) in ₹, based on where the index lands (columns) and how many days remain until expiry (rows). Hover any cell for details.")
-
-            spot_arr, dte_arr, pnl_mat = compute_pnl_heatmap(legs, lot_size, spot_price, diff, iv_for_sigma, risk_free_rate)
-
-            # Format labels
-            spot_labels = [f"{int(s):,}" for s in spot_arr]
-            dte_labels = [f"{int(d)}d left" if d > 0 else "Expiry Day" for d in dte_arr]
-
-            # Smart text: show ₹ values in K for large numbers
-            def fmt_cell(v):
-                v = int(round(v))
-                if abs(v) >= 1000:
-                    return f"₹{v/1000:+.1f}K"
-                return f"₹{v:+,}"
-
-            text_mat = [[fmt_cell(pnl_mat[i][j]) for j in range(len(spot_arr))] for i in range(len(dte_arr))]
-
-            # Color: red for loss, green for profit, dark neutral at zero
-            colorscale = [
-                [0.0,  "#991b1b"],   # deep red — max loss
-                [0.3,  "#ef4444"],   # red
-                [0.45, "#fca5a5"],   # light red
-                [0.5,  "#1e293b"],   # dark neutral — breakeven
-                [0.55, "#86efac"],   # light green
-                [0.7,  "#22c55e"],   # green
-                [1.0,  "#15803d"],   # deep green — max profit
-            ]
-
-            fig_hm = go.Figure(data=go.Heatmap(
-                z=pnl_mat,
-                x=spot_labels,
-                y=dte_labels,
-                colorscale=colorscale,
-                zmid=0,
-                text=text_mat,
-                texttemplate="%{text}",
-                textfont=dict(size=11, family="JetBrains Mono, monospace"),
-                hovertemplate=(
-                    "<b>If index at %{x}</b><br>"
-                    "With %{y}<br>"
-                    "Your P&L: <b>₹%{z:,.0f}</b>"
-                    "<extra></extra>"
-                ),
-                colorbar=dict(
-                    title=dict(text="P&L (₹)", font=dict(size=11)),
-                    tickformat=",",
-                    tickprefix="₹",
-                    len=0.9,
-                ),
-                xgap=2, ygap=2,
-            ))
-
-            fig_hm.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(17,24,39,0.6)",
-                font=dict(family="Inter, sans-serif", size=11, color="#94a3b8"),
-                margin=dict(l=50, r=30, t=40, b=40),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
-                height=380,
-                title=dict(text=f"{strat_choice} — {lot_size} lot size", font=dict(size=14)),
-                xaxis=dict(
-                    title="Index Level ➜",
-                    tickangle=-45,
-                    gridcolor="rgba(30,41,59,0.4)",
-                    side="bottom",
-                    zeroline=False,
-                ),
-                yaxis=dict(
-                    title="",
-                    gridcolor="rgba(30,41,59,0.4)",
-                    autorange="reversed",
-                    zeroline=False,
-                ),
-            )
-            # Mark current spot on categorical axis
-            current_label = f"{int(round(spot_price / diff) * diff):,}"
-            if current_label in spot_labels:
-                idx = spot_labels.index(current_label)
-                fig_hm.add_shape(
-                    type="line", x0=idx, x1=idx, y0=-0.5, y1=len(dte_arr)-0.5,
-                    xref="x", yref="y",
-                    line=dict(color="#fbbf24", width=2.5, dash="solid"),
+            # Show raw API response for deeper diagnosis
+            raw = st.session_state.get("oi_last_raw")
+            if raw:
+                st.caption(
+                    f"Last 200 response — keys: `{raw['data_keys']}` | "
+                    f"data length: **{raw['data_length']}** rows"
                 )
-                fig_hm.add_annotation(
-                    x=idx, y=-0.5, xref="x", yref="y",
-                    text="▼ You Are Here", showarrow=False,
-                    font=dict(size=11, color="#fbbf24", family="Inter"),
-                    yshift=-16,
-                )
-            st.plotly_chart(fig_hm, use_container_width=True)
+                if raw["data_length"] == 0:
+                    st.warning(
+                        "Upstox returned 200 OK but **0 contracts** for this expiry. "
+                        "This usually means:\n"
+                        "- OI data is only available **during market hours** (09:15–15:30 IST)\n"
+                        "- The expiry date has no contracts listed yet\n"
+                        "- Try enabling the **Options Chain** scope in your Upstox app settings"
+                    )
 
-            # ── Payoff at Expiry — simplified ──
-            st.markdown("#### 📐 Payoff at Expiry — Your Profit/Loss If You Hold Until End")
-            st.caption("This shows your final P&L based on where the index closes on expiry day. The flat green zone in the middle is your 'safe zone' where you keep the premium collected.")
+        if not st.session_state.get("oi_snapshot"):
+            fetch_option_chain_oi(ACCESS_TOKEN, _spot_for_oi)
 
-            expiry_pnl = pnl_mat[np.where(dte_arr == 0)[0][0]] if 0 in dte_arr else pnl_mat[0]
+    snap = st.session_state.get("oi_snapshot", {})
+    if snap:
+        ce_oi    = snap.get("ce_oi", 0)
+        pe_oi    = snap.get("pe_oi", 0)
+        pcr      = pe_oi / ce_oi if ce_oi > 0 else 1.0
+        o1, o2   = st.columns(2)
+        o1.metric("CE OI", f"{ce_oi/1e5:.2f}L")
+        o2.metric("PE OI", f"{pe_oi/1e5:.2f}L")
+        pcr_icon = "\U0001f7e2" if pcr > 1.2 else "\U0001f534" if pcr < 0.8 else "\U0001f7e1"
+        st.metric("PCR", f"{pcr_icon} {pcr:.2f}",
+                  help="PCR > 1.2 = bullish, < 0.8 = bearish")
+        hist = st.session_state.get("oi_history", [])
+        if len(hist) > 1:
+            st.line_chart(pd.DataFrame(hist).tail(15)[["ce_oi", "pe_oi"]],
+                          height=120, width='stretch')
+    elif ACCESS_TOKEN:
+        st.warning("\u26a0\ufe0f OI fetch returned no data \u2014 see diagnostic above.")
 
-            # Check if all zeros (premiums were 0)
-            has_real_data = np.any(expiry_pnl != 0)
+with col_pos:
+    st.subheader("📦 Active Position")
+    pos = st.session_state.current_position
+    if pos and ACCESS_TOKEN:
+        pos_ltp = fetch_ltp(ACCESS_TOKEN, pos["key"]) or pos["entry_price"]
+        unr_pnl = (pos_ltp - pos["entry_price"]) * LOT_SIZE - SLIPPAGE_PER_SIDE * 2 * LOT_SIZE
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Symbol", pos["symbol"])
+        c2.metric("Entry",  f"₹{pos['entry_price']:.2f}")
+        c3.metric("LTP",    f"₹{pos_ltp:.2f}")
+        c4.metric("Est. Net PnL", f"₹{unr_pnl:.2f}",
+                  delta=f"{((pos_ltp-pos['entry_price'])/pos['entry_price']*100):.1f}%")
+        risk_pts = abs(pos["entry_price"] - pos["sl_price"])
+        rwd_pts  = abs(pos["target_price"] - pos["entry_price"])
+        rr_setup = round(rwd_pts / risk_pts, 2) if risk_pts > 0 else 0
+        st.caption(
+            f"🎯 Target: **₹{pos['target_price']:.2f}** | "
+            f"🛡️ Trailing SL: **₹{pos['sl_price']:.2f}** | "
+            f"📈 Peak: **₹{pos['highest_price']:.2f}** | "
+            f"⚖️ RR: **{rr_setup}** | "
+            f"🆔 Order: `{pos.get('entry_order_id','—')}`"
+        )
+    else:
+        st.info("No open position. System is flat.")
 
-            if not has_real_data:
-                st.warning(
-                    "⚠️ All strategy leg premiums are ₹0.00 — this usually means the market is closed "
-                    "or the selected strikes don't have active quotes. The payoff chart will appear flat. "
-                    "Try again during market hours (9:15 AM – 3:30 PM IST)."
-                )
-
-            fig_payoff = go.Figure()
-
-            # Profit zone (green fill above zero)
-            profit_y = np.where(expiry_pnl >= 0, expiry_pnl, 0)
-            fig_payoff.add_trace(go.Scatter(
-                x=spot_arr, y=profit_y, mode="lines",
-                line=dict(color="rgba(0,0,0,0)", width=0),
-                fill="tozeroy", fillcolor="rgba(34,197,94,0.25)",
-                name="Profit Zone", showlegend=True,
-            ))
-
-            # Loss zone (red fill below zero)
-            loss_y = np.where(expiry_pnl <= 0, expiry_pnl, 0)
-            fig_payoff.add_trace(go.Scatter(
-                x=spot_arr, y=loss_y, mode="lines",
-                line=dict(color="rgba(0,0,0,0)", width=0),
-                fill="tozeroy", fillcolor="rgba(239,68,68,0.25)",
-                name="Loss Zone", showlegend=True,
-            ))
-
-            # Main P&L line
-            fig_payoff.add_trace(go.Scatter(
-                x=spot_arr, y=expiry_pnl, mode="lines+markers",
-                line=dict(color="#f1f5f9", width=2.5),
-                marker=dict(size=5, color="#f1f5f9"),
-                name="Your P&L",
-                hovertemplate="Index at %{x:,.0f}<br>P&L: <b>₹%{y:,.0f}</b><extra></extra>",
-            ))
-
-            # Breakeven line
-            fig_payoff.add_hline(y=0, line=dict(color="#fbbf24", width=1.5, dash="dash"),
-                                 annotation_text="Breakeven", annotation_position="bottom right",
-                                 annotation=dict(font=dict(color="#fbbf24", size=10)))
-
-            # Current spot marker
-            fig_payoff.add_vline(x=spot_price, line=dict(color="#3b82f6", dash="dash", width=1.5),
-                                 annotation_text="Current Spot",
-                                 annotation=dict(font=dict(color="#60a5fa", size=10)))
-
-            # Mark max profit and max loss
-            max_p = np.max(expiry_pnl)
-            max_l = np.min(expiry_pnl)
-            if max_p > 0:
-                best_spot = spot_arr[np.argmax(expiry_pnl)]
-                fig_payoff.add_annotation(
-                    x=best_spot, y=max_p,
-                    text=f"Max Profit ₹{max_p:,.0f}",
-                    showarrow=True, arrowhead=2, arrowcolor="#4ade80",
-                    font=dict(color="#4ade80", size=11, family="JetBrains Mono"),
-                    bgcolor="rgba(17,24,39,0.8)", bordercolor="#4ade80", borderwidth=1,
-                )
-            if max_l < 0:
-                worst_spot = spot_arr[np.argmin(expiry_pnl)]
-                fig_payoff.add_annotation(
-                    x=worst_spot, y=max_l,
-                    text=f"Max Loss ₹{max_l:,.0f}",
-                    showarrow=True, arrowhead=2, arrowcolor="#f87171",
-                    font=dict(color="#f87171", size=11, family="JetBrains Mono"),
-                    bgcolor="rgba(17,24,39,0.8)", bordercolor="#f87171", borderwidth=1,
-                )
-
-            fig_payoff.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(17,24,39,0.6)",
-                font=dict(family="Inter, sans-serif", size=11, color="#94a3b8"),
-                margin=dict(l=50, r=30, t=40, b=40),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
-                height=340,
-                title=dict(text="What Happens on Expiry Day", font=dict(size=14)),
-                xaxis=dict(title="Where the Index Closes ➜", tickformat=",", gridcolor="rgba(30,41,59,0.6)", zeroline=False),
-                yaxis=dict(title="Your Profit / Loss (₹)", tickprefix="₹", tickformat=",", gridcolor="rgba(30,41,59,0.6)", zeroline=False),
-            )
-            st.plotly_chart(fig_payoff, use_container_width=True)
-
-            # ── Quick Summary Box ──
-            if has_real_data:
-                net_credit = sum(
-                    leg["premium"] * (1 if leg["action"] == "SELL" else -1)
-                    for leg in legs
-                )
-                net_credit_total = net_credit * lot_size
-
-                summary_color = "#4ade80" if net_credit > 0 else "#f87171"
-                rr_ratio = abs(max_p / max_l) if max_l != 0 else 0
-
-                if max_l != 0:
-                    summary_html = f"""
-                    <div style="border:1px solid #1e293b; border-radius:10px; padding:16px; margin:10px 0;
-                                background:rgba(17,24,39,0.6); display:flex; flex-wrap:wrap; gap:24px; align-items:center;">
-                        <div>
-                            <div style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px;">You Collect</div>
-                            <div style="font-size:22px; font-weight:800; color:{summary_color}; font-family:'JetBrains Mono',monospace;">
-                                ₹{net_credit_total:,.0f}
-                            </div>
-                        </div>
-                        <div>
-                            <div style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px;">Best Case</div>
-                            <div style="font-size:22px; font-weight:800; color:#4ade80; font-family:'JetBrains Mono',monospace;">
-                                ₹{max_p:,.0f}
-                            </div>
-                        </div>
-                        <div>
-                            <div style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px;">Worst Case</div>
-                            <div style="font-size:22px; font-weight:800; color:#f87171; font-family:'JetBrains Mono',monospace;">
-                                ₹{max_l:,.0f}
-                            </div>
-                        </div>
-                        <div>
-                            <div style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:1.5px;">Risk:Reward</div>
-                            <div style="font-size:22px; font-weight:800; color:#e2e8f0; font-family:'JetBrains Mono',monospace;">
-                                1 : {rr_ratio:.1f}
-                            </div>
-                        </div>
-                    </div>
-                    """
-                    st.markdown(summary_html, unsafe_allow_html=True)
-
-    # ──────────────────────────────────
-    #  TAB 4: CHARTS
-    # ──────────────────────────────────
-    with tab_charts:
-
-        # OI Distribution
-        st.markdown("#### 📊 Open Interest Distribution")
-        fig_oi = go.Figure()
-        fig_oi.add_trace(go.Bar(
-            x=df["Strike"], y=df["CE OI"], name="Call OI",
-            marker=dict(color="#ef4444", opacity=0.85, line=dict(color="#b91c1c", width=0.5)),
-            offsetgroup=0,
-        ))
-        fig_oi.add_trace(go.Bar(
-            x=df["Strike"], y=df["PE OI"], name="Put OI",
-            marker=dict(color="#22c55e", opacity=0.85, line=dict(color="#15803d", width=0.5)),
-            offsetgroup=1,
-        ))
-        fig_oi.add_vline(x=atm_strike, line=dict(color="#f1f5f9", dash="dash", width=1), annotation_text="ATM")
-        fig_oi.add_vline(x=max_pain, line=dict(color="#8b5cf6", dash="dashdot", width=1), annotation_text="Max Pain")
-        fig_oi.update_layout(**PLOTLY_LAYOUT, height=380, barmode="group",
-            title=dict(text=f"OI Distribution — {selected_index_name} ({selected_expiry})", font=dict(size=13)),
-            xaxis_title="Strike", yaxis_title="Open Interest")
-        st.plotly_chart(fig_oi, use_container_width=True)
-
-        # OI Change chart
-        st.markdown("#### 🔄 OI Change (Build-up / Unwinding)")
-        fig_oichg = make_subplots(rows=1, cols=1)
-        ce_chg_colors = ["#ef4444" if v >= 0 else "#7f1d1d" for v in df["CE OI Chg"]]
-        pe_chg_colors = ["#22c55e" if v >= 0 else "#14532d" for v in df["PE OI Chg"]]
-        fig_oichg.add_trace(go.Bar(x=df["Strike"]-diff*0.15, y=df["CE OI Chg"], name="CE OI Δ",
-            marker_color=ce_chg_colors, width=diff*0.3))
-        fig_oichg.add_trace(go.Bar(x=df["Strike"]+diff*0.15, y=df["PE OI Chg"], name="PE OI Δ",
-            marker_color=pe_chg_colors, width=diff*0.3))
-        fig_oichg.add_hline(y=0, line=dict(color="#475569", width=1))
-        fig_oichg.update_layout(**PLOTLY_LAYOUT, height=320,
-            title=dict(text="OI Change — Positive = Build-up, Negative = Unwinding", font=dict(size=13)),
-            xaxis_title="Strike", yaxis_title="OI Change")
-        st.plotly_chart(fig_oichg, use_container_width=True)
-
-        ch1, ch2 = st.columns(2)
-
-        with ch1:
-            # Delta Skew
-            st.markdown("#### 📉 Delta Skew")
-            fig_d = go.Figure()
-            fig_d.add_trace(go.Scatter(x=df["Strike"], y=df["CE Delta"], mode="lines+markers",
-                line=dict(color="#3b82f6", width=2), marker=dict(size=4), name="CE Δ"))
-            fig_d.add_trace(go.Scatter(x=df["Strike"], y=df["PE Delta"], mode="lines+markers",
-                line=dict(color="#ef4444", width=2), marker=dict(size=4), name="PE Δ"))
-            fig_d.add_hline(y=0, line=dict(color="#475569", width=1))
-            fig_d.add_vline(x=atm_strike, line=dict(color="#64748b", dash="dash", width=1))
-            fig_d.update_layout(**PLOTLY_LAYOUT, height=320,
-                title=dict(text="Delta Across Strikes", font=dict(size=12)),
-                xaxis_title="Strike", yaxis_title="Delta")
-            st.plotly_chart(fig_d, use_container_width=True)
-
-        with ch2:
-            # IV Smile
-            st.markdown("#### 😊 IV Smile")
-            fig_iv = go.Figure()
-            fig_iv.add_trace(go.Scatter(x=df["Strike"], y=df["CE IV"], mode="lines+markers",
-                line=dict(color="#3b82f6", width=2), marker=dict(size=4, symbol="triangle-up"), name="CE IV"))
-            fig_iv.add_trace(go.Scatter(x=df["Strike"], y=df["PE IV"], mode="lines+markers",
-                line=dict(color="#ef4444", width=2), marker=dict(size=4, symbol="triangle-down"), name="PE IV"))
-            fig_iv.add_vline(x=atm_strike, line=dict(color="#64748b", dash="dash", width=1))
-            fig_iv.update_layout(**PLOTLY_LAYOUT, height=320,
-                title=dict(text="IV Smile / Skew", font=dict(size=12)),
-                xaxis_title="Strike", yaxis_title="IV (%)")
-            st.plotly_chart(fig_iv, use_container_width=True)
-
-        # Cumulative OI Pressure
-        st.markdown("#### ⚖️ Cumulative OI Pressure")
-        ds = df.sort_values("Strike")
-        fig_cum = go.Figure()
-        fig_cum.add_trace(go.Scatter(x=ds["Strike"], y=ds["CE OI"].cumsum(), mode="lines",
-            fill="tozeroy", fillcolor="rgba(239,68,68,0.12)",
-            line=dict(color="#ef4444", width=2), name="Cumul. Call OI"))
-        fig_cum.add_trace(go.Scatter(x=ds["Strike"], y=ds["PE OI"].cumsum(), mode="lines",
-            fill="tozeroy", fillcolor="rgba(34,197,94,0.12)",
-            line=dict(color="#22c55e", width=2), name="Cumul. Put OI"))
-        fig_cum.add_vline(x=atm_strike, line=dict(color="#64748b", dash="dash", width=1))
-        fig_cum.update_layout(**PLOTLY_LAYOUT, height=320,
-            title=dict(text="Cumulative OI Build-up", font=dict(size=13)),
-            xaxis_title="Strike", yaxis_title="Cumulative OI")
-        st.plotly_chart(fig_cum, use_container_width=True)
-
-    # ═══════════════════════════════════════════════
-    #  FOOTER
-    # ═══════════════════════════════════════════════
-
+# ==============================================================================
+# ALGORITHMIC LOOP ENGINE
+# ==============================================================================
+# ==============================================================================
+# MTF FILTER STATUS PANEL — always visible when token is present
+# ==============================================================================
+if ACCESS_TOKEN:
     st.markdown("---")
-    f1, f2, f3 = st.columns(3)
-    f1.caption(f"🕐 {datetime.now().strftime('%H:%M:%S IST')}")
-    f2.caption(f"📅 Expiry: {selected_expiry} · DTE: {tte_days:.1f}d")
-    f3.caption(f"📊 {len(df)} strikes loaded · Lot: {lot_size}")
+    st.subheader("📡 Multi-Timeframe Filter Status")
 
-    # Auto-refresh
-    if auto_refresh:
-        time.sleep(refresh_interval)
+    # ── Always fetch fresh MTF data for the panel on every render ───────────────
+    # Do NOT read stale last_tf_data — always run a fresh evaluation so the
+    # panel reflects the current market state regardless of bot_active status.
+    _vwap_panel = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50") or 0.0
+    _oi_panel   = st.session_state.get("oi_snapshot", {})
+    _oi_dict    = {
+        "oi_available": bool(_oi_panel),
+        "oi_surge_ce":  False,
+        "oi_surge_pe":  False,
+        "pcr": (_oi_panel.get("pe_oi", 0) / _oi_panel.get("ce_oi", 1))
+               if _oi_panel.get("ce_oi", 0) > 0 else 1.0,
+    }
+    _spot_panel  = nifty_spot or 24000.0
+    _signal_p, _tf_p = evaluate_mtf_signal(
+        ACCESS_TOKEN, _vwap_panel or _spot_panel, _oi_dict
+    )
+    st.session_state.last_tf_data = _tf_p
+    tf_data = _tf_p
+
+    # ── Manual refresh button ─────────────────────────────────────────────────
+    if st.button("🔄 Refresh MTF Status", key="mtf_refresh"):
+        st.session_state.last_tf_data = {}
         st.rerun()
 
-except ValueError as ve:
-    st.error(f"🚫 **Data Error**: {ve}")
-except requests.exceptions.HTTPError as he:
-    code = he.response.status_code if he.response is not None else "?"
-    st.error(f"🚫 **HTTP {code}**: Token likely expired. Re-authenticate via Upstox OAuth.")
-except requests.exceptions.ConnectionError:
-    st.error("🚫 **Connection Error**: Can't reach Upstox API.")
-except requests.exceptions.Timeout:
-    st.error("🚫 **Timeout**: API didn't respond in time.")
-except Exception as e:
-    st.error(f"🚫 {type(e).__name__}: {e}")
-    st.exception(e)
+    col_1h, col_15m, col_3m = st.columns(3)
+
+    def _filter_rows(filters: dict, label: str):
+        """Render a filter status card for one timeframe."""
+        all_pass = all(filters.values()) if filters else False
+        status_icon = "🟢" if all_pass else "🔴"
+        st.markdown(f"**{status_icon} {label}**")
+        for name, passed in filters.items():
+            icon = "✅" if passed else "❌"
+            st.caption(f"{icon} {name}")
+
+    with col_1h:
+        h1 = tf_data.get("1h", {})
+        dir_map = {1: "📈 Bullish", -1: "📉 Bearish", 0: "➡️ Neutral"}
+        direction = h1.get("direction", 0)
+        st.markdown(f"**1H Trend (30M proxy) — {dir_map.get(direction, '—')}**")
+        if h1.get("ok"):
+            st.caption(f"EMA20: {h1.get('ema20', 0):.1f} | EMA50: {h1.get('ema50', 0):.1f} | ST: {'▲' if h1.get('st') == 1 else '▼'}")
+            for name, passed in h1.get("filters", {}).items():
+                icon = "✅" if passed else "❌"
+                st.caption(f"{icon} {name}")
+        else:
+            # Show raw API error if any, so we can debug the endpoint
+            _h1_errs = [e for e in st.session_state.get("api_errors", [])
+                        if "historical-candle" in e.get("endpoint", "")]
+            if _h1_errs:
+                _e = _h1_errs[-1]
+                st.caption(f"❌ API error {_e['status']}: {_e['body'][:120]}")
+            else:
+                st.caption("⏳ Fetching 30min history (60-day, multi-day endpoint)…")
+                _debug_msg = tf_data.get("1h", {}).get("debug", "")
+                bars_got   = len(st.session_state.get("_debug_1h_bars", []))
+                st.caption(f"📊 {bars_got} bars received / 104 needed (30min × 104 = ~52hr)")
+                if _debug_msg:
+                    st.caption(f"ℹ️ {_debug_msg}")
+
+    with col_15m:
+        m15 = tf_data.get("15m", {})
+        confirmed = m15.get("confirmed", False)
+        h1_dir    = tf_data.get("1h", {}).get("direction", 0)
+        st.markdown(f"**15M Momentum — {'🟢 Confirmed' if confirmed else '🔴 Not confirmed'}**")
+        if m15.get("ok"):
+            if m15.get("proxy"):
+                st.caption("ℹ️ Using 1min proxy (< 5.5hr elapsed — 15M needs 330 bars)")
+            ema9_v  = m15.get("ema9",  0)
+            ema21_v = m15.get("ema21", 0)
+            rsi_v   = m15.get("rsi",   0)
+            close_v = m15.get("close", 0)
+            vwap_v  = m15.get("vwap",  0)
+            pcr_v   = m15.get("pcr",   0)
+            ema_ok  = ema9_v > ema21_v if h1_dir == 1 else ema9_v < ema21_v
+            rsi_ok  = (45 < rsi_v < 75) if h1_dir == 1 else (25 < rsi_v < 55)
+            vwap_ok = close_v > vwap_v  if h1_dir == 1 else close_v < vwap_v
+            oi_ok   = m15.get("oi_available", False)
+
+            st.caption(
+                f"EMA9: {ema9_v:.1f} {'>' if ema_ok else '<'} EMA21: {ema21_v:.1f} "
+                f"{'✅' if ema_ok else '❌'}"
+            )
+            st.caption(
+                f"RSI: {rsi_v:.1f} "
+                f"({'need 45–75' if h1_dir == 1 else 'need 25–55'}) "
+                f"{'✅' if rsi_ok else '❌'}"
+            )
+            st.caption(
+                f"Close: {close_v:.1f} vs VWAP: {vwap_v:.1f} "
+                f"{'✅' if vwap_ok else '❌'}"
+            )
+            if m15.get("oi_available"):
+                st.caption(f"PCR: {pcr_v:.2f} ✅")
+            else:
+                st.caption("OI: bypassed (API unavailable) ✅")
+        else:
+            _h1_dir   = tf_data.get("1h",  {}).get("direction", 0)
+            _15m_bars = tf_data.get("15m", {}).get("bars", 0)
+            if _h1_dir == 0:
+                st.caption("⏳ Waiting for 1H trend direction")
+            elif _15m_bars == 0:
+                _1min_cache = st.session_state.get("_candle_cache_1minute", {})
+                _1min_bars  = len(_1min_cache.get("df", [])) if _1min_cache else 0
+                st.caption(f"⚠️ 1min bars in cache: {_1min_bars} — check API error log if 0")
+            else:
+                st.caption(f"ℹ️ {_15m_bars} bars fetched — awaiting data")
+
+    with col_3m:
+        m3 = tf_data.get("3m", {})
+        triggered = m3.get("triggered", False)
+        h1_dir    = tf_data.get("1h", {}).get("direction", 0)
+        st.markdown(f"**3M Trigger — {'🟢 FIRE' if triggered else '🔴 Waiting'}**")
+        if m3.get("ok"):
+            ema9_v   = m3.get("ema9",  0)
+            ema21_v  = m3.get("ema21", 0)
+            rsi_v    = m3.get("rsi",   0)
+            adx_v    = m3.get("adx",   0)
+            range_v    = m3.get("range",     0)
+            rangesma_v = m3.get("range_sma", 0)
+            rsi_prev_v = m3.get("rsi_prev", 0)
+
+            ema_ok   = ema9_v > ema21_v if h1_dir == 1 else ema9_v < ema21_v
+            rsi_ok   = (rsi_v > rsi_prev_v and 45 < rsi_v < 78) if h1_dir == 1 \
+                       else (rsi_v < rsi_prev_v and 22 < rsi_v < 55)
+            range_ok = range_v > rangesma_v
+            adx_ok   = adx_v > 20
+
+            st.caption(
+                f"EMA9: {ema9_v:.1f} {'>' if ema_ok else '<'} "
+                f"EMA21: {ema21_v:.1f} {'✅' if ema_ok else '❌'}"
+            )
+            st.caption(
+                f"RSI: {rsi_v:.1f} (prev {rsi_prev_v:.1f}) "
+                f"{'rising' if rsi_v > rsi_prev_v else 'falling'} "
+                f"{'✅' if rsi_ok else '❌'}"
+            )
+            st.caption(
+                f"Range: {range_v:.1f} vs SMA: {rangesma_v:.1f} "
+                f"{'✅' if range_ok else '❌'}"
+            )
+            st.caption(
+                f"ADX: {adx_v:.1f} (need > 20) "
+                f"{'✅' if adx_ok else '❌'}"
+            )
+        else:
+            st.caption("⏳ Waiting for 15M confirm first")
+
+    # Overall signal readiness bar
+    h1_ok  = tf_data.get("1h",  {}).get("direction", 0) != 0
+    m15_ok = tf_data.get("15m", {}).get("confirmed", False)
+    m3_ok  = tf_data.get("3m",  {}).get("triggered", False)
+    layers_passed = sum([h1_ok, m15_ok, m3_ok])
+    bar_colors = ["🟥", "🟧", "🟨", "🟩"]
+    st.caption(
+        f"Signal readiness: {bar_colors[layers_passed]} "
+        f"{layers_passed}/3 layers passed "
+        f"({'Entry armed — RR check next' if layers_passed == 3 else 'Monitoring…'})"
+    )
+
+# ==============================================================================
+# ALGORITHMIC LOOP ENGINE
+# ==============================================================================
+if st.session_state.bot_active and ACCESS_TOKEN:
+
+    # ── Daily guardrail checks ────────────────────────────────────────────────
+    allowed, reason = check_daily_guardrails(
+        st.session_state.session_pnl, trade_count, MAX_DAILY_LOSS, MAX_TRADES
+    )
+    if not allowed:
+        if "limit" in reason.lower() or "max" in reason.lower():
+            st.session_state.bot_active = False
+        st.warning(reason)
+        time.sleep(30)
+        st.rerun()
+
+    # ── VWAP scalar ───────────────────────────────────────────────────────────
+    spot_ref  = nifty_spot or 24000.0
+    live_vwap = fetch_vwap_from_ohlc(ACCESS_TOKEN, "NSE_INDEX|Nifty 50")
+    if live_vwap and live_vwap > 0:
+        vwap_value = live_vwap
+    else:
+        # Fallback: compute from 3M candles
+        df3_vwap = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50", interval="1minute")
+        if not df3_vwap.empty:
+            tp         = (df3_vwap["high"] + df3_vwap["low"] + df3_vwap["close"]) / 3
+            vwap_s     = (tp * df3_vwap["volume"]).cumsum() / df3_vwap["volume"].cumsum().replace(0, float("nan"))
+            valid      = vwap_s.dropna()
+            vwap_value = float(valid.iloc[-1]) if not valid.empty else spot_ref
+        else:
+            vwap_value = spot_ref
+
+    # ── OI snapshot ───────────────────────────────────────────────────────────
+    oi     = fetch_option_chain_oi(ACCESS_TOKEN, spot_ref)
+    master = load_instrument_master()
+
+    # ── MTF signal evaluation ─────────────────────────────────────────────────
+    if st.session_state.current_position is None:
+        signal, tf_data = evaluate_mtf_signal(ACCESS_TOKEN, vwap_value, oi)
+
+        # Store for the filter status panel (rerenders even when no trade)
+        st.session_state.last_tf_data = tf_data
+
+        if signal in ("call", "put"):
+            ot            = "CE" if signal == "call" else "PE"
+            ikey, isymbol = resolve_atm_option_key(ACCESS_TOKEN, spot_ref, ot, master)
+            entry_ltp     = fetch_ltp(ACCESS_TOKEN, ikey)
+
+            if entry_ltp is None or entry_ltp <= 0:
+                st.warning(f"⚠️ No valid LTP for {isymbol} — skipping.")
+            else:
+                # ATR-based SL/Target from 3M df
+                df3 = tf_data.get("3m", {}).get("df", pd.DataFrame())
+                atr_levels = compute_atr_sl_target(df3, entry_ltp, ATR_MULTIPLIER, RR_MIN)                              if not df3.empty else None
+                if atr_levels:
+                    sl_price, target_price = atr_levels
+                else:
+                    sl_price     = entry_ltp * (1 - STOP_LOSS_PCT)
+                    target_price = entry_ltp * (1 + TARGET_PCT)
+
+                risk_pts = entry_ltp - sl_price
+                rwd_pts  = target_price - entry_ltp
+                rr_setup = rwd_pts / risk_pts if risk_pts > 0 else 0
+
+                if rr_setup < RR_MIN:
+                    st.warning(f"⚖️ RR {rr_setup:.2f} < min {RR_MIN} — skipping {isymbol}.")
+                else:
+                    order_id = place_order(ACCESS_TOKEN, ikey, "BUY", LOT_SIZE,
+                                           order_type="MARKET", paper_mode=IS_PAPER)
+                    if order_id is None and not IS_PAPER:
+                        st.error("🚨 BUY order failed — entry aborted.")
+                    else:
+                        st.session_state.current_position = {
+                            "key":            ikey,
+                            "symbol":         isymbol,
+                            "entry_price":    entry_ltp,
+                            "highest_price":  entry_ltp,
+                            "sl_price":       sl_price,
+                            "target_price":   target_price,
+                            "entry_time":     now_ist().strftime("%H:%M:%S"),
+                            "direction":      ot,
+                            "entry_order_id": order_id,
+                            "rr_setup":       round(rr_setup, 2),
+                        }
+                        lbl = "📈 CALL" if ot == "CE" else "📉 PUT"
+                        st.success(
+                            f"🚨 {lbl} — {isymbol} @ ₹{entry_ltp:.2f} | "
+                            f"SL ₹{sl_price:.2f} | Tgt ₹{target_price:.2f} | "
+                            f"RR {rr_setup:.2f} | Order: {order_id}"
+                        )
+                        st.rerun()
+        else:
+            # No signal — still update tf_data for dashboard
+            st.session_state.last_tf_data = tf_data
+
+    # ── Position management ───────────────────────────────────────────────────
+    else:
+        pos     = st.session_state.current_position
+        pos_ltp = fetch_ltp(ACCESS_TOKEN, pos["key"])
+        if pos_ltp is None:
+            st.warning("⚠️ LTP fetch failed — retrying.")
+        else:
+            if pos_ltp > pos["highest_price"]:
+                st.session_state.current_position["highest_price"] = pos_ltp
+                # Use fresh 3M ATR for trailing SL
+                df3_trail = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50", interval="1minute")
+                atr_levels = compute_atr_sl_target(df3_trail, pos_ltp, ATR_MULTIPLIER, RR_MIN)                              if not df3_trail.empty else None
+                new_sl = atr_levels[0] if atr_levels else pos_ltp * (1 - STOP_LOSS_PCT)
+                if new_sl > pos["sl_price"]:
+                    st.session_state.current_position["sl_price"] = new_sl
+
+            hit_sl     = pos_ltp <= st.session_state.current_position["sl_price"]
+            hit_target = pos_ltp >= pos["target_price"]
+            if hit_sl or hit_target:
+                reason = "TARGET HIT ✅" if hit_target else "STOP LOSS ❌"
+                exit_position(ACCESS_TOKEN, pos, pos_ltp, reason, IS_PAPER, LOT_SIZE)
+                st.rerun()
+
+    time.sleep(3)
+    st.rerun()
+
+# TRADE LOG + SESSION STATS
+# ==============================================================================
+st.markdown("---")
+st.subheader("📑 Session Trade Log")
+
+if st.session_state.trade_logs:
+    df_logs = pd.DataFrame(st.session_state.trade_logs)
+
+    def style_pnl(val):
+        color = "#22c55e" if val > 0 else "#ef4444" if val < 0 else "#94a3b8"
+        return f"color: {color}; font-weight: bold"
+
+    st.dataframe(df_logs.style.applymap(style_pnl, subset=["Net PnL ₹"]),
+                 width='stretch')
+
+    total      = len(df_logs)
+    wins       = (df_logs["Net PnL ₹"] > 0).sum()
+    losses     = total - wins
+    wr         = wins / total * 100 if total else 0
+    avg_w      = df_logs[df_logs["Net PnL ₹"] > 0]["Net PnL ₹"].mean() if wins   else 0
+    avg_l      = df_logs[df_logs["Net PnL ₹"] <= 0]["Net PnL ₹"].mean() if losses else 0
+    rr_avg     = df_logs["RR Realised"].mean() if "RR Realised" in df_logs.columns else 0
+    ev         = (wr / 100 * avg_w) + ((1 - wr / 100) * avg_l)
+    total_slip = df_logs["Slippage ₹"].sum() if "Slippage ₹" in df_logs.columns else 0
+
+    s1, s2, s3, s4, s5, s6, s7 = st.columns(7)
+    s1.metric("Trades",         total)
+    s2.metric("Win Rate",       f"{wr:.1f}%")
+    s3.metric("Avg Win",        f"₹{avg_w:.0f}")
+    s4.metric("Avg Loss",       f"₹{avg_l:.0f}")
+    s5.metric("Avg RR",         f"{rr_avg:.2f}",
+              delta="✅ On target" if rr_avg >= RR_MIN else "⚠️ Below target")
+    s6.metric("Expected Value", f"₹{ev:.0f}/trade",
+              delta="✅ Positive" if ev > 0 else "🔴 Negative edge")
+    s7.metric("Total Slippage", f"₹{total_slip:.0f}")
+
+    with st.expander("📈 Equity Curve"):
+        df_logs["Cumulative PnL"] = df_logs["Net PnL ₹"].cumsum()
+        st.line_chart(df_logs["Cumulative PnL"], width='stretch')
+else:
+    st.info("No trades executed this session.")
+
+# ── Order log + API error log ─────────────────────────────────────────────────
+if st.session_state.order_log:
+    with st.expander("🗂️ Raw Order Log"):
+        st.dataframe(pd.DataFrame(st.session_state.order_log), width='stretch')
+
+if st.session_state.get("api_errors"):
+    with st.expander(f"⚠️ API Error Log ({len(st.session_state.api_errors)} errors)"):
+        st.dataframe(pd.DataFrame(st.session_state.api_errors), width='stretch')
