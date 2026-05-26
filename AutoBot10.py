@@ -375,19 +375,31 @@ def fetch_historical_candles(token: str, instrument_key: str,
 
     safe_key = instrument_key.replace(" ", "%20")
     url      = f"{UPSTOX_BASE_URL}/historical-candle/intraday/{safe_key}/{interval}"
-    data     = _raw_get(token, url)
+    data = _raw_get(token, url)
     if data is None:
         return pd.DataFrame()
     try:
         candles = data["data"]["candles"]
+        if not candles:
+            # Empty candles list — do NOT cache, allow retry next cycle
+            return pd.DataFrame()
         df = pd.DataFrame(candles,
                           columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
         df = df.iloc[::-1].reset_index(drop=True)
         for col in ["open", "high", "low", "close", "volume", "oi"]:
             df[col] = pd.to_numeric(df[col])
-        st.session_state[cache_key] = {"df": df, "ts": time.time()}
+        # Only cache non-empty successful results
+        if not df.empty:
+            st.session_state[cache_key] = {"df": df, "ts": time.time()}
         return df
-    except Exception:
+    except Exception as e:
+        # Log the parse error so it appears in the API error log
+        st.session_state.setdefault("api_errors", []).append({
+            "time":     now_ist().strftime("%H:%M:%S"),
+            "endpoint": url.split("api.upstox.com")[-1].split("?")[0],
+            "status":   "parse_error",
+            "body":     str(e)[:200],
+        })
         return pd.DataFrame()
 
 
@@ -1349,7 +1361,14 @@ if ACCESS_TOKEN:
             if _h1_dir == 0 or _h1_dir == "not set":
                 st.caption("⚠️ 1H direction=0 — EMA/Supertrend not aligned on 30M bars")
             elif _15m_bars == 0 or _15m_bars == "?":
-                st.caption("⚠️ 15M fetch returned 0 bars — check API error log")
+                # Check if 1min cache itself has data
+                _1min_cache = st.session_state.get("_candle_cache_1minute", {})
+                _1min_bars  = len(_1min_cache.get("df", [])) if _1min_cache else 0
+                st.caption(
+                    f"⚠️ 15M resampled to 0 bars. "
+                    f"1min cache: **{_1min_bars} bars**. "
+                    f"{'1min fetch OK — resample issue' if _1min_bars > 0 else '1min fetch failed — check API error log'}"
+                )
             else:
                 st.caption("⏳ 15M has data but confirmation conditions not met — see numbers above")
 
