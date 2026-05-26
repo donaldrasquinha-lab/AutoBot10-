@@ -819,21 +819,35 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
     Indicators: EMA 9/21 state, RSI 14, VWAP side, OI/PCR.
     Only evaluated when 1H direction is non-zero.
     """
-    df, ok = get_tf_data(token, "15minute", 5)
-    if not ok:
+    # Use 1-minute bars directly for 15M confirmation — same data, more bars
+    # Resampled 15M bars cause NaN on EMA/RSI due to insufficient warm-up bars
+    # early in the session. 1min gives 100+ bars immediately after open.
+    df_raw, ok_raw = get_tf_data(token, "1minute", 20)
+    if not ok_raw:
         return {"ok": False, "confirmed": False, "filters": {},
-                "bars": len(df) if not df.empty else 0}
+                "bars": 0}
 
+    # Use last 100 1-min bars for indicator computation
+    df = df_raw.tail(100).reset_index(drop=True)
+
+    # EMA windows on 1min equivalent to 15M context:
+    # 15M EMA9  ≈ 1min EMA 135 (9 × 15), but for intraday sensitivity use EMA 9/21
+    # on 1min directly — confirms short-term momentum direction
     df["EMA_9"]  = ta.trend.ema_indicator(df["close"], window=9)
     df["EMA_21"] = ta.trend.ema_indicator(df["close"], window=21)
     df["RSI"]    = ta.momentum.rsi(df["close"], window=14)
+
+    # Drop NaN rows from indicator warm-up
+    df = df.dropna(subset=["EMA_9", "EMA_21", "RSI"]).reset_index(drop=True)
+    if df.empty:
+        return {"ok": False, "confirmed": False, "filters": {}, "bars": 0}
 
     last = df.iloc[-1]
     ema_state_bull = float(last["EMA_9"]) > float(last["EMA_21"])
     ema_state_bear = float(last["EMA_9"]) < float(last["EMA_21"])
     rsi_val        = float(last["RSI"])
-    rsi_mid_bull   = 50 < rsi_val < 75    # above midpoint, not overbought
-    rsi_mid_bear   = 25 < rsi_val < 50    # below midpoint, not oversold
+    rsi_mid_bull   = 50 < rsi_val < 75
+    rsi_mid_bear   = 25 < rsi_val < 50
     close_15m      = float(last["close"])
     above_vwap     = close_15m > vwap_value
     below_vwap     = close_15m < vwap_value
@@ -873,7 +887,7 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
         "vwap": vwap_value,
         "pcr": oi.get("pcr", 0),
         "oi_available": oi.get("oi_available", False),
-        "bars": len(df),
+        "bars": len(df_raw),
     }
 
 
@@ -885,15 +899,22 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     ADX here confirms the 3M move has real momentum — not just a random wiggle.
     Uses STATE not crossover — avoids the timing coincidence problem entirely.
     """
-    df, ok = get_tf_data(token, "3minute", 5)
-    if not ok:
+    # Use 1-minute bars resampled to 3M for the trigger layer
+    # dropna() after indicators to eliminate warm-up NaN rows
+    df_raw, ok_raw = get_tf_data(token, "3minute", 5)
+    if not ok_raw:
         return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
 
+    df = df_raw.copy()
     df["EMA_9"]   = ta.trend.ema_indicator(df["close"], window=9)
     df["EMA_21"]  = ta.trend.ema_indicator(df["close"], window=21)
     df["RSI"]     = ta.momentum.rsi(df["close"], window=14)
-    df["Vol_SMA"] = df["volume"].rolling(window=20).mean()
-    df["ADX"]     = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
+    df["Vol_SMA"] = df["volume"].rolling(window=10).mean()   # 10-bar SMA on 3M (was 20)
+    df["ADX"]     = ta.trend.adx(df["high"], df["low"], df["close"], window=7)  # 7-bar ADX on 3M
+
+    df = df.dropna(subset=["EMA_9", "EMA_21", "RSI", "Vol_SMA", "ADX"]).reset_index(drop=True)
+    if len(df) < 2:
+        return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
