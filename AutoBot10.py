@@ -756,16 +756,15 @@ def build_resampled_indicators(df_1min: pd.DataFrame, n: int) -> pd.DataFrame:
 
     df = pd.DataFrame(records).reset_index(drop=True)
 
-    # Step 2: Compute indicators on the resampled bars
-    df["EMA_9"]   = ta.trend.ema_indicator(df["close"], window=9)
-    df["EMA_21"]  = ta.trend.ema_indicator(df["close"], window=21)
-    df["RSI"]     = ta.momentum.rsi(df["close"], window=14)
-    df["Vol_SMA"] = df["volume"].rolling(window=10).mean()
-    df["ADX"]     = ta.trend.adx(df["high"], df["low"], df["close"], window=7)
+    # Step 2: Compute only EMA and RSI — shared by both 15M and 3M layers.
+    # ADX and Vol_SMA are computed separately in build_3m_trigger where
+    # we can guard for minimum bar count before calling adx().
+    df["EMA_9"]  = ta.trend.ema_indicator(df["close"], window=9)
+    df["EMA_21"] = ta.trend.ema_indicator(df["close"], window=21)
+    df["RSI"]    = ta.momentum.rsi(df["close"], window=14)
 
-    # Drop warm-up NaN rows — only affects early bars, last row will be valid
-    # once we have enough resampled bars (need 21 for EMA21, 14 for RSI)
-    df = df.dropna().reset_index(drop=True)
+    # Drop warm-up NaN rows from EMA/RSI initialisation
+    df = df.dropna(subset=["EMA_9", "EMA_21", "RSI"]).reset_index(drop=True)
     return df
 
 
@@ -943,6 +942,21 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     if len(df) < 2:
         return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
 
+    # Add Vol_SMA on resampled bars
+    df["Vol_SMA"] = df["volume"].rolling(window=min(10, len(df))).mean()
+
+    # ADX needs at least (2 × window + 1) bars — only compute if enough exist
+    adx_window = 7
+    if len(df) >= adx_window * 2 + 1:
+        df["ADX"] = ta.trend.adx(df["high"], df["low"], df["close"], window=adx_window)
+        adx_val   = float(df["ADX"].dropna().iloc[-1]) if not df["ADX"].dropna().empty else 0.0
+    else:
+        adx_val = 25.0   # assume trending when not enough bars — let other filters decide
+
+    df = df.dropna(subset=["Vol_SMA"]).reset_index(drop=True)
+    if len(df) < 2:
+        return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -953,7 +967,7 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     rsi_rising     = rsi_now > rsi_prev and 45 < rsi_now < 78
     rsi_falling    = rsi_now < rsi_prev and 22 < rsi_now < 55
     vol_surge      = float(last["volume"]) > float(last["Vol_SMA"])
-    adx_strong     = float(last["ADX"]) > 20   # confirms move has momentum at entry
+    adx_strong     = adx_val > 20
 
     if trend_dir == 1:
         triggered = ema_state_bull and rsi_rising and vol_surge and adx_strong
@@ -981,7 +995,7 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
         "ema21":    float(last["EMA_21"]),
         "rsi":      rsi_now,
         "rsi_prev": rsi_prev,
-        "adx":      float(last["ADX"]),
+        "adx":      adx_val,
         "vol":      float(last["volume"]),
         "vol_sma":  float(last["Vol_SMA"]) if not pd.isna(last["Vol_SMA"]) else 0.0,
         "df":       df,
