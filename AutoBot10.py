@@ -981,6 +981,20 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+# ── Bust stale cache keys from old invalid interval calls ─────────────────────
+# Previous versions called 15minute and 3minute directly against the Upstox
+# intraday endpoint which rejects them. Clear any cached failures so the new
+# resample-based approach starts fresh on every app load.
+for _stale_key in ["_candle_cache_15minute", "_candle_cache_3minute"]:
+    if _stale_key in st.session_state:
+        del st.session_state[_stale_key]
+
+# Clear API errors older than today to avoid confusing stale errors in the log
+_today_str = now_ist().strftime("%H")   # clear if new session hour
+if st.session_state.get("_error_log_hour") != _today_str:
+    st.session_state["api_errors"]     = []
+    st.session_state["_error_log_hour"] = _today_str
+
 # SESSION STATE BOOTSTRAP
 # ==============================================================================
 st.set_page_config(page_title="Upstox Algo Scalper", layout="wide")
@@ -1000,6 +1014,20 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ── Bust stale cache keys from old invalid interval calls ─────────────────────
+# Previous versions called 15minute and 3minute directly against the Upstox
+# intraday endpoint which rejects them. Clear any cached failures so the new
+# resample-based approach starts fresh on every app load.
+for _stale_key in ["_candle_cache_15minute", "_candle_cache_3minute"]:
+    if _stale_key in st.session_state:
+        del st.session_state[_stale_key]
+
+# Clear API errors older than today to avoid confusing stale errors in the log
+_today_str = now_ist().strftime("%H")   # clear if new session hour
+if st.session_state.get("_error_log_hour") != _today_str:
+    st.session_state["api_errors"]     = []
+    st.session_state["_error_log_hour"] = _today_str
 
 # ==============================================================================
 # SIDEBAR
