@@ -724,21 +724,24 @@ def resample_candles(df: pd.DataFrame, n: int) -> pd.DataFrame:
 
 def build_resampled_indicators(df_1min: pd.DataFrame, n: int) -> pd.DataFrame:
     """
-    Correct way to get Nth-minute indicators that match chart values:
-      1. Resample 1-min OHLCV into N-min candles (proper OHLCV aggregation)
-      2. Compute EMA/RSI/ADX/Volume on the resampled candles
-      3. Return the resampled df with indicator columns populated
+    Resamples 1-min OHLCV into N-min candles and computes indicators.
 
-    This matches what TradingView/Upstox chart shows because RSI/EMA are
-    computed on N-minute price moves, not 1-minute price moves.
+    Key insight: ta library fills NaN with 0 by default — so 9 resampled bars
+    with EMA21 gives wrong values (0-filled), not NaN. We cannot use dropna
+    to detect bad values. Instead we ensure enough resampled bars exist:
+      - EMA21 needs >=21 bars to be accurate
+      - RSI14 needs >=14 bars
+      - Minimum safe threshold: 22 resampled bars
 
-    Pre-warming: enough 1-min bars exist that the resampled series has
-    sufficient history for indicators to be valid (no NaN on last row).
+    If fewer than 22 bars exist after resampling, return empty df so the
+    caller handles it gracefully rather than using wrong indicator values.
     """
-    if df_1min.empty or len(df_1min) < n:
+    MIN_RESAMPLED = 22   # enough for EMA21 + 1 buffer bar
+
+    if df_1min.empty or len(df_1min) < n * MIN_RESAMPLED:
         return pd.DataFrame()
 
-    # Step 1: Resample OHLCV into N-min bars
+    # Resample OHLCV
     records = []
     for i in range(0, len(df_1min) - (len(df_1min) % n), n):
         chunk = df_1min.iloc[i : i + n]
@@ -751,20 +754,16 @@ def build_resampled_indicators(df_1min: pd.DataFrame, n: int) -> pd.DataFrame:
             "volume":    chunk["volume"].sum(),
             "oi":        chunk["oi"].iloc[-1],
         })
-    if not records:
+    if not records or len(records) < MIN_RESAMPLED:
         return pd.DataFrame()
 
     df = pd.DataFrame(records).reset_index(drop=True)
 
-    # Step 2: Compute only EMA and RSI — shared by both 15M and 3M layers.
-    # ADX and Vol_SMA are computed separately in build_3m_trigger where
-    # we can guard for minimum bar count before calling adx().
+    # Compute EMA and RSI on the properly-sized resampled series
     df["EMA_9"]  = ta.trend.ema_indicator(df["close"], window=9)
     df["EMA_21"] = ta.trend.ema_indicator(df["close"], window=21)
     df["RSI"]    = ta.momentum.rsi(df["close"], window=14)
 
-    # Drop warm-up NaN rows from EMA/RSI initialisation
-    df = df.dropna(subset=["EMA_9", "EMA_21", "RSI"]).reset_index(drop=True)
     return df
 
 
@@ -866,15 +865,28 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
     Indicators: EMA 9/21 state, RSI 14, VWAP side, OI/PCR.
     Only evaluated when 1H direction is non-zero.
     """
-    # Fetch 1min bars and resample to proper 15M OHLCV, then compute indicators
-    # This matches chart RSI/EMA exactly — indicators computed on 15M candles
-    df_1min, ok_1min = get_tf_data(token, "1minute", 30)
+    # Fetch 1min bars. Need 330+ for accurate 15M resampling (22 bars × 15min).
+    # With fewer bars, use 1min indicators directly — less accurate but valid.
+    df_1min, ok_1min = get_tf_data(token, "1minute", 20)
     if not ok_1min:
         return {"ok": False, "confirmed": False, "filters": {}, "bars": 0}
 
     df_15m = build_resampled_indicators(df_1min, 15)
+
     if df_15m.empty:
-        return {"ok": False, "confirmed": False, "filters": {}, "bars": len(df_1min)}
+        # Not enough bars for proper 15M — use 1min series with standard windows
+        # This is used early session (<5.5 hrs elapsed) only
+        df_work = df_1min.copy()
+        df_work["EMA_9"]  = ta.trend.ema_indicator(df_work["close"], window=9)
+        df_work["EMA_21"] = ta.trend.ema_indicator(df_work["close"], window=21)
+        df_work["RSI"]    = ta.momentum.rsi(df_work["close"], window=14)
+        df_work = df_work.dropna(subset=["EMA_9", "EMA_21", "RSI"])
+        if df_work.empty:
+            return {"ok": False, "confirmed": False, "filters": {}, "bars": len(df_1min)}
+        df_15m = df_work   # use 1min as proxy — note in panel
+        using_proxy = True
+    else:
+        using_proxy = False
 
     last = df_15m.iloc[-1]
     ema_state_bull = float(last["EMA_9"]) > float(last["EMA_21"])
@@ -922,6 +934,7 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
         "pcr": oi.get("pcr", 0),
         "oi_available": oi.get("oi_available", False),
         "bars": len(df_15m) if not df_15m.empty else 0,
+        "proxy": using_proxy,
     }
 
 
@@ -1386,6 +1399,8 @@ if ACCESS_TOKEN:
         h1_dir    = tf_data.get("1h", {}).get("direction", 0)
         st.markdown(f"**15M Momentum — {'🟢 Confirmed' if confirmed else '🔴 Not confirmed'}**")
         if m15.get("ok"):
+            if m15.get("proxy"):
+                st.caption("ℹ️ Using 1min proxy (< 5.5hr elapsed — 15M needs 330 bars)")
             ema9_v  = m15.get("ema9",  0)
             ema21_v = m15.get("ema21", 0)
             rsi_v   = m15.get("rsi",   0)
