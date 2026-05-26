@@ -694,7 +694,7 @@ def build_1h_trend(token: str) -> dict:
     104 bars = ~52 trading hours of context.
     Trend LAYER.
     Determines overall market direction.
-    Indicators: EMA 20/50 state, ADX 14, Supertrend (7,3).
+    Indicators: EMA 20/50 state, Supertrend only. No ADX — direction is enough here.
     Returns dict of filter states + direction (+1 bull, -1 bear, 0 neutral).
     """
     df, ok = get_tf_data(token, "30minute", 104)
@@ -708,35 +708,31 @@ def build_1h_trend(token: str) -> dict:
 
     df["EMA_20"] = ta.trend.ema_indicator(df["close"], window=40)   # 40×30min ≈ 20×1H
     df["EMA_50"] = ta.trend.ema_indicator(df["close"], window=100)  # 100×30min ≈ 50×1H
-    df["ADX"]    = ta.trend.adx(df["high"], df["low"], df["close"], window=28)  # 28×30min ≈ 14×1H
     df["ST"]     = compute_supertrend(df, length=14, multiplier=3.0)  # scaled for 30min
 
     last = df.iloc[-1]
-    ema_bull  = float(last["EMA_20"]) > float(last["EMA_50"])
-    ema_bear  = float(last["EMA_20"]) < float(last["EMA_50"])
-    adx_trend = float(last["ADX"]) > 20      # 20 on 1H is sufficient (less noise)
-    st_bull   = int(last["ST"]) == 1
-    st_bear   = int(last["ST"]) == -1
+    ema_bull = float(last["EMA_20"]) > float(last["EMA_50"])
+    ema_bear = float(last["EMA_20"]) < float(last["EMA_50"])
+    st_bull  = int(last["ST"]) == 1
+    st_bear  = int(last["ST"]) == -1
 
-    if ema_bull and adx_trend and st_bull:
+    if ema_bull and st_bull:
         direction = 1
-    elif ema_bear and adx_trend and st_bear:
+    elif ema_bear and st_bear:
         direction = -1
     else:
         direction = 0
 
     filters = {
-        "EMA 20>50 (bull)":  ema_bull,
-        "EMA 20<50 (bear)":  ema_bear,
-        "ADX > 20":          adx_trend,
-        "Supertrend bull":   st_bull,
-        "Supertrend bear":   st_bear,
+        "EMA 20>50 (bull)": ema_bull,
+        "EMA 20<50 (bear)": ema_bear,
+        "Supertrend bull":  st_bull,
+        "Supertrend bear":  st_bear,
     }
     return {
         "ok": True, "direction": direction, "filters": filters,
         "ema20": float(last["EMA_20"]), "ema50": float(last["EMA_50"]),
-        "adx": float(last["ADX"]), "st": int(last["ST"]),
-        "close": float(last["close"]),
+        "st": int(last["ST"]), "close": float(last["close"]),
     }
 
 
@@ -804,7 +800,8 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     """
     3-Minute timeframe — ENTRY TRIGGER LAYER.
     Fine-tunes exact entry timing. Only evaluated when 1H + 15M agree.
-    Indicators: EMA 9/21 state (aligned with trend), volume surge, RSI slope.
+    Indicators: EMA 9/21 state, RSI slope, volume surge, ADX > 20.
+    ADX here confirms the 3M move has real momentum — not just a random wiggle.
     Uses STATE not crossover — avoids the timing coincidence problem entirely.
     """
     df, ok = get_tf_data(token, "3minute", 25)
@@ -815,6 +812,7 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     df["EMA_21"]  = ta.trend.ema_indicator(df["close"], window=21)
     df["RSI"]     = ta.momentum.rsi(df["close"], window=14)
     df["Vol_SMA"] = df["volume"].rolling(window=20).mean()
+    df["ADX"]     = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -826,20 +824,23 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     rsi_rising     = rsi_now > rsi_prev and 45 < rsi_now < 78
     rsi_falling    = rsi_now < rsi_prev and 22 < rsi_now < 55
     vol_surge      = float(last["volume"]) > float(last["Vol_SMA"])
+    adx_strong     = float(last["ADX"]) > 20   # confirms move has momentum at entry
 
     if trend_dir == 1:
-        triggered = ema_state_bull and rsi_rising and vol_surge
+        triggered = ema_state_bull and rsi_rising and vol_surge and adx_strong
         filters = {
             "EMA 9>21 (bull state)": ema_state_bull,
             "RSI rising 45–78":      rsi_rising,
             "Volume surge":          vol_surge,
+            "ADX > 20 (momentum)":   adx_strong,
         }
     elif trend_dir == -1:
-        triggered = ema_state_bear and rsi_falling and vol_surge
+        triggered = ema_state_bear and rsi_falling and vol_surge and adx_strong
         filters = {
             "EMA 9<21 (bear state)": ema_state_bear,
             "RSI falling 22–55":     rsi_falling,
             "Volume surge":          vol_surge,
+            "ADX > 20 (momentum)":   adx_strong,
         }
     else:
         triggered = False
@@ -848,7 +849,7 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     return {
         "ok": True, "triggered": triggered, "filters": filters,
         "ema9": float(last["EMA_9"]), "ema21": float(last["EMA_21"]),
-        "rsi": rsi_now, "df": df,
+        "rsi": rsi_now, "adx": float(last["ADX"]), "df": df,
     }
 
 
@@ -1182,8 +1183,7 @@ if ACCESS_TOKEN:
         direction = h1.get("direction", 0)
         st.markdown(f"**1H Trend (30M proxy) — {dir_map.get(direction, '—')}**")
         if h1.get("ok"):
-            st.caption(f"EMA20: {h1.get('ema20', 0):.1f} | EMA50: {h1.get('ema50', 0):.1f}")
-            st.caption(f"ADX: {h1.get('adx', 0):.1f} | ST: {'▲' if h1.get('st') == 1 else '▼'}")
+            st.caption(f"EMA20: {h1.get('ema20', 0):.1f} | EMA50: {h1.get('ema50', 0):.1f} | ST: {'▲' if h1.get('st') == 1 else '▼'}")
             for name, passed in h1.get("filters", {}).items():
                 icon = "✅" if passed else "❌"
                 st.caption(f"{icon} {name}")
@@ -1221,7 +1221,7 @@ if ACCESS_TOKEN:
         st.markdown(f"**3M Trigger — {'🟢 FIRE' if triggered else '🔴 Waiting'}**")
         if m3.get("ok"):
             st.caption(f"EMA9: {m3.get('ema9', 0):.1f} | EMA21: {m3.get('ema21', 0):.1f}")
-            st.caption(f"RSI: {m3.get('rsi', 0):.1f}")
+            st.caption(f"RSI: {m3.get('rsi', 0):.1f} | ADX: {m3.get('adx', 0):.1f}")
             for name, passed in m3.get("filters", {}).items():
                 icon = "✅" if passed else "❌"
                 st.caption(f"{icon} {name}")
