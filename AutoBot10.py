@@ -153,6 +153,46 @@ def ist_time_str() -> str:
     return now_ist().strftime("%H:%M:%S IST")
 
 
+def get_active_expiry_str(master: pd.DataFrame | None = None) -> str:
+    """
+    Returns the correct weekly Nifty expiry date (YYYY-MM-DD) in IST.
+
+    Rules:
+      - Non-Thursday: nearest upcoming Thursday
+      - Thursday before 15:25 IST: TODAY (contracts still live)
+      - Thursday after  15:25 IST: next Thursday (roll over after settlement)
+
+    If an instrument master is provided and has upcoming expiries,
+    the first valid date from the master is used instead of the formula
+    — this handles exchange holiday rollovers automatically.
+    """
+    now       = now_ist()
+    today_ist = now.date()
+    cutoff    = now.replace(hour=15, minute=25, second=0, microsecond=0)
+
+    # ── Master-based resolution (most accurate) ───────────────────────────────
+    if master is not None and not master.empty:
+        expiries = get_weekly_expiries(master)   # already filtered to >= today IST
+        if expiries:
+            nearest = expiries[0]
+            # If nearest expiry is today AND we are past cutoff → use next one
+            if nearest == today_ist and now >= cutoff and len(expiries) > 1:
+                return expiries[1].strftime("%Y-%m-%d")
+            return nearest.strftime("%Y-%m-%d")
+
+    # ── Formula fallback ──────────────────────────────────────────────────────
+    days_to_thursday = (3 - today_ist.weekday()) % 7   # 0 = today is Thursday
+
+    if days_to_thursday == 0:
+        # Today is expiry day
+        if now >= cutoff:
+            days_to_thursday = 7   # roll to next week after 15:25
+        # else: stay at 0 — use today's expiry
+
+    expiry = today_ist + timedelta(days=days_to_thursday)
+    return expiry.strftime("%Y-%m-%d")
+
+
 # ==============================================================================
 # INSTRUMENT MASTER
 # ==============================================================================
@@ -184,7 +224,7 @@ def load_instrument_master() -> pd.DataFrame:
 
 
 def get_weekly_expiries(master: pd.DataFrame) -> list[date]:
-    today    = date.today()
+    today    = now_ist().date()
     expiries = sorted(master["expiry_date"].dropna().unique())
     return [e for e in expiries if e >= today]
 
@@ -208,12 +248,9 @@ def resolve_atm_option_key(token: str, spot: float, option_type: str,
                 if ltp is not None and ltp > 0:
                     return ikey, row.get("trading_symbol", ikey)
     # Formula fallback
-    today            = date.today()
-    days_to_thursday = (3 - today.weekday()) % 7
-    if days_to_thursday == 0 and now_ist().hour >= 15:
-        days_to_thursday = 7
-    expiry = today + timedelta(days=days_to_thursday)
-    symbol = f"NIFTY{expiry.strftime('%y%b%d').upper()}{atm_strike}{ot}"
+    expiry_str = get_active_expiry_str()
+    expiry     = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+    symbol     = f"NIFTY{expiry.strftime('%y%b%d').upper()}{atm_strike}{ot}"
     return f"NSE_FO|{symbol}", symbol
 
 
@@ -299,15 +336,7 @@ def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
 def fetch_option_chain_oi(token: str, spot: float) -> dict:
     atm_strike = round(spot / 50) * 50
     master     = st.session_state.get("instrument_master", pd.DataFrame())
-    expiries   = get_weekly_expiries(master) if not master.empty else []
-    if expiries:
-        expiry_str = expiries[0].strftime("%Y-%m-%d")
-    else:
-        today            = date.today()
-        days_to_thursday = (3 - today.weekday()) % 7
-        if days_to_thursday == 0 and now_ist().hour >= 15:
-            days_to_thursday = 7
-        expiry_str = (today + timedelta(days=days_to_thursday)).strftime("%Y-%m-%d")
+    expiry_str = get_active_expiry_str(master)
 
     # ── Raw URL — pipe and space sent exactly as Upstox expects ──────────────
     url  = _build_url(f"{UPSTOX_BASE_URL}/option/chain",
@@ -324,8 +353,32 @@ def fetch_option_chain_oi(token: str, spot: float) -> dict:
     if data is None:
         return empty
 
+    # Store raw response for diagnostic panel
+    st.session_state["oi_last_raw"] = {
+        "status": "200",
+        "data_keys": list(data.keys()) if isinstance(data, dict) else str(type(data)),
+        "data_length": len(data.get("data", [])) if isinstance(data, dict) else 0,
+        "sample": str(data)[:400],
+    }
+
     try:
-        chain   = data["data"]
+        chain = data.get("data", [])
+
+        # Empty chain — API returned 200 but no contracts for this expiry
+        if not chain:
+            st.session_state.setdefault("api_errors", []).append({
+                "time": now_ist().strftime("%H:%M:%S"),
+                "endpoint": "/option/chain",
+                "status": "200_EMPTY",
+                "body": (
+                    f"Empty data array for expiry_date={expiry_str}. "
+                    "Possible causes: (1) expiry not yet listed by Upstox, "
+                    "(2) outside market hours — OI data unavailable, "
+                    "(3) try next Thursday expiry."
+                ),
+            })
+            return empty
+
         atm_row = min(chain, key=lambda r: abs(float(r.get("strike_price", 0)) - atm_strike))
         ce_oi   = float(atm_row.get("call_options", {}).get("market_data", {}).get("oi", 0))
         pe_oi   = float(atm_row.get("put_options",  {}).get("market_data", {}).get("oi", 0))
@@ -430,7 +483,7 @@ def exit_position(token: str, pos: dict, exit_price: float, exit_reason: str,
 
     st.session_state.session_pnl += net_pnl
     st.session_state.trade_logs.append({
-        "Date":        date.today().isoformat(),
+        "Date":        now_ist().date().isoformat(),
         "Entry Time":  pos["entry_time"],
         "Exit Time":   now_ist().strftime("%H:%M:%S"),
         "Symbol":      pos["symbol"],
@@ -745,7 +798,7 @@ with col_ctrl:
         if st.session_state.trade_logs:
             csv_bytes = pd.DataFrame(st.session_state.trade_logs).to_csv(index=False).encode()
             st.download_button("📥 Trade Log (CSV)", data=csv_bytes,
-                               file_name=f"scalper_{date.today()}.csv",
+                               file_name=f"scalper_{now_ist().date()}.csv",
                                mime="text/csv", width='stretch')
 
 with col_oi:
@@ -753,16 +806,8 @@ with col_oi:
 
     if ACCESS_TOKEN:
         _spot_for_oi = nifty_spot if nifty_spot else 24000.0
-        _master   = st.session_state.get("instrument_master", pd.DataFrame())
-        _expiries = get_weekly_expiries(_master) if not _master.empty else []
-        if _expiries:
-            _expiry_str = _expiries[0].strftime("%Y-%m-%d")
-        else:
-            _today = date.today()
-            _dtt   = (3 - _today.weekday()) % 7
-            if _dtt == 0 and now_ist().hour >= 15:
-                _dtt = 7
-            _expiry_str = (_today + timedelta(days=_dtt)).strftime("%Y-%m-%d")
+        _master     = st.session_state.get("instrument_master", pd.DataFrame())
+        _expiry_str = get_active_expiry_str(_master)
 
         _oi_url = _build_url(
             f"{UPSTOX_BASE_URL}/option/chain",
@@ -780,9 +825,25 @@ with col_oi:
                      if "option" in e.get("endpoint", "")]
             if _errs:
                 _e = _errs[-1]
-                st.error(f"Last error {_e['time']} \u2014 HTTP {_e['status']}: {_e['body']}")
+                st.error(f"Last error {_e['time']} — HTTP {_e['status']}: {_e['body']}")
             else:
                 st.success("No OI API errors logged.")
+
+            # Show raw API response for deeper diagnosis
+            raw = st.session_state.get("oi_last_raw")
+            if raw:
+                st.caption(
+                    f"Last 200 response — keys: `{raw['data_keys']}` | "
+                    f"data length: **{raw['data_length']}** rows"
+                )
+                if raw["data_length"] == 0:
+                    st.warning(
+                        "Upstox returned 200 OK but **0 contracts** for this expiry. "
+                        "This usually means:\n"
+                        "- OI data is only available **during market hours** (09:15–15:30 IST)\n"
+                        "- The expiry date has no contracts listed yet\n"
+                        "- Try enabling the **Options Chain** scope in your Upstox app settings"
+                    )
 
         if not st.session_state.get("oi_snapshot"):
             fetch_option_chain_oi(ACCESS_TOKEN, _spot_for_oi)
