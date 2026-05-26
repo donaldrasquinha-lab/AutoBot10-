@@ -158,9 +158,9 @@ def get_active_expiry_str(master: pd.DataFrame | None = None) -> str:
     Returns the correct weekly Nifty expiry date (YYYY-MM-DD) in IST.
 
     Rules:
-      - Non-Thursday: nearest upcoming Thursday
-      - Thursday before 15:25 IST: TODAY (contracts still live)
-      - Thursday after  15:25 IST: next Thursday (roll over after settlement)
+      - Non-Tuesday: nearest upcoming Tuesday
+      - Tuesday before 15:25 IST: TODAY (contracts still live)
+      - Tuesday after  15:25 IST: next Tuesday (roll over after settlement)
 
     If an instrument master is provided and has upcoming expiries,
     the first valid date from the master is used instead of the formula
@@ -181,16 +181,91 @@ def get_active_expiry_str(master: pd.DataFrame | None = None) -> str:
             return nearest.strftime("%Y-%m-%d")
 
     # ── Formula fallback ──────────────────────────────────────────────────────
-    days_to_thursday = (3 - today_ist.weekday()) % 7   # 0 = today is Thursday
+    days_to_expiry = (1 - today_ist.weekday()) % 7  # 0 when today is Tuesday (expiry day)
 
-    if days_to_thursday == 0:
+    if days_to_expiry == 0:
         # Today is expiry day
         if now >= cutoff:
-            days_to_thursday = 7   # roll to next week after 15:25
+            days_to_expiry = 7   # roll to next week after 15:25
         # else: stay at 0 — use today's expiry
 
-    expiry = today_ist + timedelta(days=days_to_thursday)
+    expiry = today_ist + timedelta(days=days_to_expiry)
     return expiry.strftime("%Y-%m-%d")
+
+
+def fetch_valid_expiries(token: str) -> list[str]:
+    """
+    Fetches real available expiry dates directly from Upstox
+    /v2/option/contract endpoint. Returns a sorted list of
+    YYYY-MM-DD strings >= today IST. Falls back to formula if API fails.
+    This is the only reliable way to know which expiries Upstox has live data for.
+    """
+    cached = st.session_state.get("valid_expiries", [])
+    if cached:
+        return cached
+
+    url  = _build_url(
+        f"{UPSTOX_BASE_URL}/option/contract",
+        {"instrument_key": "NSE_INDEX|Nifty 50"}
+    )
+    data = _raw_get(token, url)
+    if data is None:
+        return []
+
+    try:
+        contracts  = data.get("data", [])
+        today_ist  = now_ist().date()
+        expiry_set = set()
+        for c in contracts:
+            exp_str = c.get("expiry", "")
+            if exp_str:
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                    if exp_date >= today_ist:
+                        expiry_set.add(exp_str)
+                except ValueError:
+                    continue
+        sorted_expiries = sorted(expiry_set)
+        st.session_state["valid_expiries"] = sorted_expiries
+        return sorted_expiries
+    except Exception:
+        return []
+
+
+def get_active_expiry_from_upstox(token: str) -> str:
+    """
+    Gets the correct active expiry date from Upstox directly.
+    On expiry day before 15:25 IST  → returns today's expiry.
+    On expiry day after  15:25 IST  → returns next available expiry.
+    All other days                  → returns nearest upcoming expiry.
+    Falls back to get_active_expiry_str() formula if API unavailable.
+    """
+    expiries = fetch_valid_expiries(token)
+
+    if not expiries:
+        # API unavailable — use formula fallback
+        master = st.session_state.get("instrument_master", pd.DataFrame())
+        return get_active_expiry_str(master)
+
+    now       = now_ist()
+    today_str = now_ist().date().strftime("%Y-%m-%d")
+    cutoff    = now.replace(hour=15, minute=25, second=0, microsecond=0)
+
+    # If today is in the list and we're before cutoff — use today
+    if today_str in expiries and now < cutoff:
+        return today_str
+
+    # Otherwise use the first future expiry (skips today if past cutoff)
+    for exp in expiries:
+        if exp > today_str:
+            return exp
+        if exp == today_str and now < cutoff:
+            return exp
+
+    # All expiries are in the past — formula fallback
+    master = st.session_state.get("instrument_master", pd.DataFrame())
+    return get_active_expiry_str(master)
+
 
 
 # ==============================================================================
@@ -335,8 +410,8 @@ def fetch_vwap_from_ohlc(token: str, instrument_key: str) -> float | None:
 
 def fetch_option_chain_oi(token: str, spot: float) -> dict:
     atm_strike = round(spot / 50) * 50
-    master     = st.session_state.get("instrument_master", pd.DataFrame())
-    expiry_str = get_active_expiry_str(master)
+    # Get expiry from Upstox directly — most reliable source
+    expiry_str = get_active_expiry_from_upstox(token)
 
     # ── Raw URL — pipe and space sent exactly as Upstox expects ──────────────
     url  = _build_url(f"{UPSTOX_BASE_URL}/option/chain",
@@ -374,7 +449,7 @@ def fetch_option_chain_oi(token: str, spot: float) -> dict:
                     f"Empty data array for expiry_date={expiry_str}. "
                     "Possible causes: (1) expiry not yet listed by Upstox, "
                     "(2) outside market hours — OI data unavailable, "
-                    "(3) try next Thursday expiry."
+                    "(3) try next Tuesday expiry."
                 ),
             })
             return empty
@@ -806,8 +881,8 @@ with col_oi:
 
     if ACCESS_TOKEN:
         _spot_for_oi = nifty_spot if nifty_spot else 24000.0
-        _master     = st.session_state.get("instrument_master", pd.DataFrame())
-        _expiry_str = get_active_expiry_str(_master)
+        # Get expiry directly from Upstox
+        _expiry_str = get_active_expiry_from_upstox(ACCESS_TOKEN)
 
         _oi_url = _build_url(
             f"{UPSTOX_BASE_URL}/option/chain",
