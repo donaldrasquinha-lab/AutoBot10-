@@ -819,7 +819,7 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
     Indicators: EMA 9/21 state, RSI 14, VWAP side, OI/PCR.
     Only evaluated when 1H direction is non-zero.
     """
-    df, ok = get_tf_data(token, "15minute", 10)
+    df, ok = get_tf_data(token, "15minute", 5)
     if not ok:
         return {"ok": False, "confirmed": False, "filters": {},
                 "bars": len(df) if not df.empty else 0}
@@ -885,7 +885,7 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     ADX here confirms the 3M move has real momentum — not just a random wiggle.
     Uses STATE not crossover — avoids the timing coincidence problem entirely.
     """
-    df, ok = get_tf_data(token, "3minute", 10)
+    df, ok = get_tf_data(token, "3minute", 5)
     if not ok:
         return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
 
@@ -1357,7 +1357,7 @@ if ACCESS_TOKEN:
             _h1_ok   = tf_data.get("1h",  {}).get("ok", False)
             _15m_bars = tf_data.get("15m", {}).get("bars", "?")
             st.caption(f"1H direction: **{_h1_dir}** | 1H ok: **{_h1_ok}**")
-            st.caption(f"15M bars available: **{_15m_bars}** (need ≥ 10 for EMA21)")
+            st.caption(f"15M bars available: **{_15m_bars}** (need ≥ 5)")
             if _h1_dir == 0 or _h1_dir == "not set":
                 st.caption("⚠️ 1H direction=0 — EMA/Supertrend not aligned on 30M bars")
             elif _15m_bars == 0 or _15m_bars == "?":
