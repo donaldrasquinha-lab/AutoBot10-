@@ -671,23 +671,58 @@ def compute_atr_sl_target(df, entry_ltp, atr_multiplier, rr_min, delta=0.5):
     return round(sl_price, 2), round(target_price, 2)
 
 
+def resample_candles(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """
+    Resamples 1-min OHLCV candles into n-minute bars by grouping every n rows.
+    Used to synthesise 3-min and 15-min candles from the 1-min intraday feed
+    since Upstox intraday only supports 1minute and 30minute intervals.
+    """
+    if df.empty or n <= 1:
+        return df
+    records = []
+    for i in range(0, len(df) - (len(df) % n), n):
+        chunk = df.iloc[i : i + n]
+        records.append({
+            "timestamp": chunk["timestamp"].iloc[0],
+            "open":      chunk["open"].iloc[0],
+            "high":      chunk["high"].max(),
+            "low":       chunk["low"].min(),
+            "close":     chunk["close"].iloc[-1],
+            "volume":    chunk["volume"].sum(),
+            "oi":        chunk["oi"].iloc[-1],
+        })
+    return pd.DataFrame(records).reset_index(drop=True)
+
+
 def get_tf_data(token: str, interval: str, min_bars: int):
     """
     Fetch candles for a given interval. Returns (df, ok: bool).
-    Uses multi-day historical endpoint for 30minute (intraday only returns today's bars).
-    Uses intraday endpoint for 15minute and 3minute.
+
+    Upstox intraday  endpoint accepts: 1minute, 30minute only.
+    Upstox historical endpoint accepts: 1minute, 30minute, day, week, month.
+
+    Mapping:
+      30minute (1H proxy) -> multi-day historical (30minute)
+      15minute            -> intraday 1minute, resampled x15
+      3minute             -> intraday 1minute, resampled x3
+      1minute             -> intraday 1minute directly
     """
     if interval == "30minute":
         df = fetch_historical_candles_multi_day(
             token, "NSE_INDEX|Nifty 50", interval="30minute", days_back=60
         )
+    elif interval == "15minute":
+        raw = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval="1minute")
+        df  = resample_candles(raw, 15)
+    elif interval == "3minute":
+        raw = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval="1minute")
+        df  = resample_candles(raw, 3)
     else:
         df = fetch_historical_candles(token, "NSE_INDEX|Nifty 50", interval=interval)
+
     if df.empty or len(df) < min_bars:
         return pd.DataFrame(), False
     return df, True
-
-
 def build_1h_trend(token: str) -> dict:
     """
     30-Minute bars used as 1H proxy (Upstox historical API supports 30minute, not 60minute).
@@ -1336,7 +1371,7 @@ if st.session_state.bot_active and ACCESS_TOKEN:
         vwap_value = live_vwap
     else:
         # Fallback: compute from 3M candles
-        df3_vwap = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50", interval="3minute")
+        df3_vwap = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50", interval="1minute")
         if not df3_vwap.empty:
             tp         = (df3_vwap["high"] + df3_vwap["low"] + df3_vwap["close"]) / 3
             vwap_s     = (tp * df3_vwap["volume"]).cumsum() / df3_vwap["volume"].cumsum().replace(0, float("nan"))
@@ -1418,7 +1453,7 @@ if st.session_state.bot_active and ACCESS_TOKEN:
             if pos_ltp > pos["highest_price"]:
                 st.session_state.current_position["highest_price"] = pos_ltp
                 # Use fresh 3M ATR for trailing SL
-                df3_trail = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50", interval="3minute")
+                df3_trail = fetch_historical_candles(ACCESS_TOKEN, "NSE_INDEX|Nifty 50", interval="1minute")
                 atr_levels = compute_atr_sl_target(df3_trail, pos_ltp, ATR_MULTIPLIER, RR_MIN)                              if not df3_trail.empty else None
                 new_sl = atr_levels[0] if atr_levels else pos_ltp * (1 - STOP_LOSS_PCT)
                 if new_sl > pos["sl_price"]:
