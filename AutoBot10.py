@@ -1430,24 +1430,16 @@ if ACCESS_TOKEN:
             else:
                 st.caption("OI: bypassed (API unavailable) ✅")
         else:
-            _h1_dir  = tf_data.get("1h",  {}).get("direction", "not set")
-            _h1_ok   = tf_data.get("1h",  {}).get("ok", False)
-            _15m_bars = tf_data.get("15m", {}).get("bars", "?")
-            st.caption(f"1H direction: **{_h1_dir}** | 1H ok: **{_h1_ok}**")
-            st.caption(f"15M bars available: **{_15m_bars}** (need ≥ 5)")
-            if _h1_dir == 0 or _h1_dir == "not set":
-                st.caption("⚠️ 1H direction=0 — EMA/Supertrend not aligned on 30M bars")
-            elif _15m_bars == 0 or _15m_bars == "?":
-                # Check if 1min cache itself has data
+            _h1_dir   = tf_data.get("1h",  {}).get("direction", 0)
+            _15m_bars = tf_data.get("15m", {}).get("bars", 0)
+            if _h1_dir == 0:
+                st.caption("⏳ Waiting for 1H trend direction")
+            elif _15m_bars == 0:
                 _1min_cache = st.session_state.get("_candle_cache_1minute", {})
                 _1min_bars  = len(_1min_cache.get("df", [])) if _1min_cache else 0
-                st.caption(
-                    f"⚠️ 15M resampled to 0 bars. "
-                    f"1min cache: **{_1min_bars} bars**. "
-                    f"{'1min fetch OK — resample issue' if _1min_bars > 0 else '1min fetch failed — check API error log'}"
-                )
+                st.caption(f"⚠️ 1min bars in cache: {_1min_bars} — check API error log if 0")
             else:
-                st.caption("⏳ 15M has data but confirmation conditions not met — see numbers above")
+                st.caption(f"ℹ️ {_15m_bars} bars fetched — awaiting data")
 
     with col_3m:
         m3 = tf_data.get("3m", {})
