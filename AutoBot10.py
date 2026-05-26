@@ -892,8 +892,8 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
     ema_state_bull = float(last["EMA_9"]) > float(last["EMA_21"])
     ema_state_bear = float(last["EMA_9"]) < float(last["EMA_21"])
     rsi_val        = float(last["RSI"])
-    rsi_mid_bull   = 50 < rsi_val < 75
-    rsi_mid_bear   = 25 < rsi_val < 50
+    rsi_mid_bull   = 45 < rsi_val < 75  # 45 floor accounts for 1min proxy underestimation
+    rsi_mid_bear   = 25 < rsi_val < 55  # 55 ceiling accounts for 1min proxy overestimation
     close_15m      = float(last["close"])
     above_vwap     = close_15m > vwap_value
     below_vwap     = close_15m < vwap_value
@@ -910,7 +910,7 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
         confirmed = ema_state_bull and rsi_mid_bull and above_vwap and oi_ok_call
         filters = {
             "EMA 9>21 (bull state)": ema_state_bull,
-            "RSI 50–75":             rsi_mid_bull,
+            "RSI 45–75":             rsi_mid_bull,
             "Price > VWAP":          above_vwap,
             "OI/PCR confirms call":  oi_ok_call,
         }
@@ -918,7 +918,7 @@ def build_15m_confirm(token: str, trend_dir: int, vwap_value: float, oi: dict) -
         confirmed = ema_state_bear and rsi_mid_bear and below_vwap and oi_ok_put
         filters = {
             "EMA 9<21 (bear state)": ema_state_bear,
-            "RSI 25–50":             rsi_mid_bear,
+            "RSI 25–55":             rsi_mid_bear,
             "Price < VWAP":          below_vwap,
             "OI/PCR confirms put":   oi_ok_put,
         }
@@ -1410,7 +1410,7 @@ if ACCESS_TOKEN:
             vwap_v  = m15.get("vwap",  0)
             pcr_v   = m15.get("pcr",   0)
             ema_ok  = ema9_v > ema21_v if h1_dir == 1 else ema9_v < ema21_v
-            rsi_ok  = (50 < rsi_v < 75) if h1_dir == 1 else (25 < rsi_v < 50)
+            rsi_ok  = (45 < rsi_v < 75) if h1_dir == 1 else (25 < rsi_v < 55)
             vwap_ok = close_v > vwap_v  if h1_dir == 1 else close_v < vwap_v
             oi_ok   = m15.get("oi_available", False)
 
@@ -1420,7 +1420,7 @@ if ACCESS_TOKEN:
             )
             st.caption(
                 f"RSI: {rsi_v:.1f} "
-                f"({'need 50–75' if h1_dir == 1 else 'need 25–50'}) "
+                f"({'need 45–75' if h1_dir == 1 else 'need 25–55'}) "
                 f"{'✅' if rsi_ok else '❌'}"
             )
             st.caption(
