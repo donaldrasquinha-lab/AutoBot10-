@@ -955,18 +955,19 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     if len(df) < 2:
         return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
 
-    # Add Vol_SMA on resampled bars
-    df["Vol_SMA"] = df["volume"].rolling(window=min(10, len(df))).mean()
-
     # ADX needs at least (2 × window + 1) bars — only compute if enough exist
     adx_window = 7
     if len(df) >= adx_window * 2 + 1:
         df["ADX"] = ta.trend.adx(df["high"], df["low"], df["close"], window=adx_window)
-        adx_val   = float(df["ADX"].dropna().iloc[-1]) if not df["ADX"].dropna().empty else 0.0
+        adx_val   = float(df["ADX"].dropna().iloc[-1]) if not df["ADX"].dropna().empty else 25.0
     else:
-        adx_val = 25.0   # assume trending when not enough bars — let other filters decide
+        adx_val = 25.0   # assume trending when not enough bars
 
-    df = df.dropna(subset=["Vol_SMA"]).reset_index(drop=True)
+    # Bar range expansion — proxy for volume surge on index instruments
+    # (NSE_INDEX volume is always 0; candle range expansion signals momentum)
+    df["Bar_Range"]     = df["high"] - df["low"]
+    df["Bar_Range_SMA"] = df["Bar_Range"].rolling(window=min(10, len(df))).mean()
+    df = df.dropna(subset=["Bar_Range_SMA"]).reset_index(drop=True)
     if len(df) < 2:
         return {"ok": False, "triggered": False, "filters": {}, "df": pd.DataFrame()}
 
@@ -979,24 +980,25 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
     rsi_prev       = float(prev["RSI"])
     rsi_rising     = rsi_now > rsi_prev and 45 < rsi_now < 78
     rsi_falling    = rsi_now < rsi_prev and 22 < rsi_now < 55
-    vol_surge      = float(last["volume"]) > float(last["Vol_SMA"])
+    # Range expansion: current bar range > 10-bar average range (momentum proxy)
+    range_expand   = float(last["Bar_Range"]) > float(last["Bar_Range_SMA"])
     adx_strong     = adx_val > 20
 
     if trend_dir == 1:
-        triggered = ema_state_bull and rsi_rising and vol_surge and adx_strong
+        triggered = ema_state_bull and rsi_rising and range_expand and adx_strong
         filters = {
-            "EMA 9>21 (bull state)": ema_state_bull,
-            "RSI rising 45–78":      rsi_rising,
-            "Volume surge":          vol_surge,
-            "ADX > 20 (momentum)":   adx_strong,
+            "EMA 9>21 (bull state)":   ema_state_bull,
+            "RSI rising 45–78":        rsi_rising,
+            "Range expansion":         range_expand,
+            "ADX > 20 (momentum)":     adx_strong,
         }
     elif trend_dir == -1:
-        triggered = ema_state_bear and rsi_falling and vol_surge and adx_strong
+        triggered = ema_state_bear and rsi_falling and range_expand and adx_strong
         filters = {
-            "EMA 9<21 (bear state)": ema_state_bear,
-            "RSI falling 22–55":     rsi_falling,
-            "Volume surge":          vol_surge,
-            "ADX > 20 (momentum)":   adx_strong,
+            "EMA 9<21 (bear state)":   ema_state_bear,
+            "RSI falling 22–55":       rsi_falling,
+            "Range expansion":         range_expand,
+            "ADX > 20 (momentum)":     adx_strong,
         }
     else:
         triggered = False
@@ -1009,8 +1011,8 @@ def build_3m_trigger(token: str, trend_dir: int) -> dict:
         "rsi":      rsi_now,
         "rsi_prev": rsi_prev,
         "adx":      adx_val,
-        "vol":      float(last["volume"]),
-        "vol_sma":  float(last["Vol_SMA"]) if not pd.isna(last["Vol_SMA"]) else 0.0,
+        "range":     float(last["Bar_Range"]),
+        "range_sma": float(last["Bar_Range_SMA"]) if not pd.isna(last["Bar_Range_SMA"]) else 0.0,
         "df":       df,
     }
 
@@ -1451,14 +1453,15 @@ if ACCESS_TOKEN:
             ema21_v  = m3.get("ema21", 0)
             rsi_v    = m3.get("rsi",   0)
             adx_v    = m3.get("adx",   0)
-            vol_v    = m3.get("vol",   0)
-            volsma_v = m3.get("vol_sma", 0)
+            range_v    = m3.get("range",     0)
+            rangesma_v = m3.get("range_sma", 0)
             rsi_prev_v = m3.get("rsi_prev", 0)
 
-            ema_ok  = ema9_v > ema21_v if h1_dir == 1 else ema9_v < ema21_v
-            rsi_ok  = (rsi_v > rsi_prev_v and 45 < rsi_v < 78) if h1_dir == 1                       else (rsi_v < rsi_prev_v and 22 < rsi_v < 55)
-            vol_ok  = vol_v > volsma_v
-            adx_ok  = adx_v > 20
+            ema_ok   = ema9_v > ema21_v if h1_dir == 1 else ema9_v < ema21_v
+            rsi_ok   = (rsi_v > rsi_prev_v and 45 < rsi_v < 78) if h1_dir == 1 \
+                       else (rsi_v < rsi_prev_v and 22 < rsi_v < 55)
+            range_ok = range_v > rangesma_v
+            adx_ok   = adx_v > 20
 
             st.caption(
                 f"EMA9: {ema9_v:.1f} {'>' if ema_ok else '<'} "
@@ -1470,8 +1473,8 @@ if ACCESS_TOKEN:
                 f"{'✅' if rsi_ok else '❌'}"
             )
             st.caption(
-                f"Vol: {vol_v:,.0f} vs SMA: {volsma_v:,.0f} "
-                f"{'✅' if vol_ok else '❌'}"
+                f"Range: {range_v:.1f} vs SMA: {rangesma_v:.1f} "
+                f"{'✅' if range_ok else '❌'}"
             )
             st.caption(
                 f"ADX: {adx_v:.1f} (need > 20) "
