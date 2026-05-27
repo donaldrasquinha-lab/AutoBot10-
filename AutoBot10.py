@@ -553,6 +553,175 @@ def fetch_option_chain_oi(token: str, spot: float) -> dict:
 
 
 # ==============================================================================
+# OI ANALYSIS ENGINE
+# Fetches full option chain across all strikes and computes:
+#   1. Max Pain — strike where total option buyers lose most money
+#   2. CE/PE OI walls — strikes with highest OI (resistance/support)
+#   3. OI change direction — net writing vs unwinding signals move
+#   4. Price target estimates based on OI wall distance from spot
+# ==============================================================================
+
+def fetch_full_option_chain(token: str, spot: float) -> list:
+    """
+    Fetches the complete option chain for the active expiry.
+    Returns list of strike-level dicts, each with CE/PE OI, LTP, IV etc.
+    Cached for 60 seconds to avoid hammering the API.
+    """
+    cache_key = "_full_chain_cache"
+    cached    = st.session_state.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 60:
+        return cached["data"]
+
+    expiry_str = get_active_expiry_from_upstox(token)
+    url  = _build_url(f"{UPSTOX_BASE_URL}/option/chain",
+                      {"instrument_key": "NSE_INDEX|Nifty 50",
+                       "expiry_date":    expiry_str})
+    data = _raw_get(token, url)
+    if data is None or not data.get("data"):
+        return []
+
+    chain = data["data"]
+    st.session_state[cache_key] = {"data": chain, "ts": time.time()}
+    return chain
+
+
+def compute_oi_analysis(chain: list, spot: float) -> dict:
+    """
+    Analyses the full option chain to produce:
+      - max_pain        : strike price where option writers profit most
+      - ce_wall         : highest CE OI strike (call writing = resistance)
+      - pe_wall         : highest PE OI strike (put writing = support)
+      - ce_wall_oi      : CE wall OI value
+      - pe_wall_oi      : PE wall OI value
+      - net_oi_change   : total CE OI chg - total PE OI chg (+ = bearish pressure)
+      - direction       : 'bullish' / 'bearish' / 'neutral'
+      - direction_reason: human-readable explanation
+      - ce_target       : price target if bullish (next CE resistance)
+      - pe_target       : price target if bearish (next PE support)
+      - points_to_ce    : distance from spot to CE wall
+      - points_to_pe    : distance from spot to PE wall
+      - atm_pcr         : PCR at ATM ± 2 strikes
+      - pain_ce_target  : expected move towards max pain from spot
+    """
+    if not chain:
+        return {}
+
+    atm = round(spot / 50) * 50
+
+    strikes     = []
+    ce_oi_map   = {}
+    pe_oi_map   = {}
+    ce_ltp_map  = {}
+    pe_ltp_map  = {}
+    ce_chg_map  = {}
+    pe_chg_map  = {}
+
+    for row in chain:
+        try:
+            strike = float(row.get("strike_price", 0))
+            ce     = row.get("call_options", {}).get("market_data", {})
+            pe     = row.get("put_options",  {}).get("market_data", {})
+
+            ce_oi_map[strike]  = float(ce.get("oi",         0))
+            pe_oi_map[strike]  = float(pe.get("oi",         0))
+            ce_ltp_map[strike] = float(ce.get("ltp",        0))
+            pe_ltp_map[strike] = float(pe.get("ltp",        0))
+            ce_chg_map[strike] = float(ce.get("oi_day_change", 0))
+            pe_chg_map[strike] = float(pe.get("oi_day_change", 0))
+            strikes.append(strike)
+        except (TypeError, ValueError):
+            continue
+
+    if not strikes:
+        return {}
+
+    strikes = sorted(set(strikes))
+
+    # ── 1. Max Pain ────────────────────────────────────────────────────────────
+    # At each strike, compute total loss to all option buyers if expiry = that strike
+    pain = {}
+    for s in strikes:
+        ce_loss = sum(max(0, s - k) * ce_oi_map.get(k, 0) for k in strikes)   # CE buyers lose
+        pe_loss = sum(max(0, k - s) * pe_oi_map.get(k, 0) for k in strikes)   # PE buyers lose
+        pain[s] = ce_loss + pe_loss
+    max_pain = min(pain, key=pain.get)
+
+    # ── 2. OI Walls ────────────────────────────────────────────────────────────
+    # Look above spot for CE wall (resistance), below spot for PE wall (support)
+    ce_above = {s: v for s, v in ce_oi_map.items() if s >= atm}
+    pe_below = {s: v for s, v in pe_oi_map.items() if s <= atm}
+
+    ce_wall = max(ce_above, key=ce_above.get) if ce_above else atm + 100
+    pe_wall = max(pe_below, key=pe_below.get) if pe_below else atm - 100
+
+    # ── 3. OI Change Direction ─────────────────────────────────────────────────
+    # CE OI increasing above spot = call writing = resistance (bearish for spot)
+    # PE OI increasing below spot = put writing = support (bullish for spot)
+    ce_chg_above = sum(v for s, v in ce_chg_map.items() if s >= atm - 100)
+    pe_chg_below = sum(v for s, v in pe_chg_map.items() if s <= atm + 100)
+
+    # ── 4. ATM PCR (±2 strikes around ATM) ────────────────────────────────────
+    atm_strikes = [s for s in strikes if abs(s - atm) <= 100]
+    atm_ce_oi   = sum(ce_oi_map.get(s, 0) for s in atm_strikes)
+    atm_pe_oi   = sum(pe_oi_map.get(s, 0) for s in atm_strikes)
+    atm_pcr     = (atm_pe_oi / atm_ce_oi) if atm_ce_oi > 0 else 1.0
+
+    # ── 5. Direction Signal ────────────────────────────────────────────────────
+    # Bullish: PE OI building below spot (put writers defending support)
+    #          AND CE OI not building excessively above
+    # Bearish: CE OI building above spot (call writers capping upside)
+    #          AND PE OI not building below
+    pe_support_building = pe_chg_below > 0 and pe_chg_below > abs(ce_chg_above) * 0.7
+    ce_resist_building  = ce_chg_above > 0 and ce_chg_above > abs(pe_chg_below) * 0.7
+
+    if atm_pcr > 1.3 and pe_support_building:
+        direction = "bullish"
+        reason    = f"PE writers defending support (PCR {atm_pcr:.2f} > 1.3, PE OI building)"
+    elif atm_pcr < 0.8 and ce_resist_building:
+        direction = "bearish"
+        reason    = f"CE writers capping upside (PCR {atm_pcr:.2f} < 0.8, CE OI building)"
+    elif atm_pcr > 1.1:
+        direction = "bullish"
+        reason    = f"Mild bullish bias (PCR {atm_pcr:.2f})"
+    elif atm_pcr < 0.9:
+        direction = "bearish"
+        reason    = f"Mild bearish bias (PCR {atm_pcr:.2f})"
+    else:
+        direction = "neutral"
+        reason    = f"No clear OI bias (PCR {atm_pcr:.2f})"
+
+    # ── 6. Price Targets ───────────────────────────────────────────────────────
+    points_to_ce    = ce_wall - spot
+    points_to_pe    = spot - pe_wall
+    pain_move       = max_pain - spot
+
+    # Conservative target = 60% of distance to wall (options rarely hit the wall exactly)
+    ce_target       = round(spot + points_to_ce * 0.6, 0)
+    pe_target       = round(spot - points_to_pe * 0.6, 0)
+
+    return {
+        "spot":           spot,
+        "atm":            atm,
+        "max_pain":       max_pain,
+        "pain_move":      round(pain_move, 0),
+        "ce_wall":        ce_wall,
+        "pe_wall":        pe_wall,
+        "ce_wall_oi":     ce_oi_map.get(ce_wall, 0),
+        "pe_wall_oi":     pe_oi_map.get(pe_wall, 0),
+        "points_to_ce":   round(points_to_ce, 0),
+        "points_to_pe":   round(points_to_pe, 0),
+        "ce_target":      ce_target,
+        "pe_target":      pe_target,
+        "atm_pcr":        round(atm_pcr, 2),
+        "ce_chg_above":   round(ce_chg_above / 1e5, 2),
+        "pe_chg_below":   round(pe_chg_below / 1e5, 2),
+        "direction":      direction,
+        "reason":         reason,
+        "total_strikes":  len(strikes),
+    }
+
+
+# ==============================================================================
 # ORDER ROUTING
 # ==============================================================================
 
@@ -1344,6 +1513,100 @@ with col_pos:
 # ALGORITHMIC LOOP ENGINE
 # ==============================================================================
 # ==============================================================================
+# ==============================================================================
+# OI DIRECTION + PRICE TARGET PANEL
+# ==============================================================================
+if ACCESS_TOKEN and nifty_spot:
+    st.markdown("---")
+    st.subheader("🎯 OI Direction & Price Targets")
+
+    # Fetch full chain (60s cached)
+    _chain = fetch_full_option_chain(ACCESS_TOKEN, nifty_spot)
+    _oia   = compute_oi_analysis(_chain, nifty_spot)
+
+    if _oia:
+        dir_icon = {"bullish": "📈", "bearish": "📉", "neutral": "➡️"}
+        dir_col  = {"bullish": "green", "bearish": "red", "neutral": "gray"}
+        d = _oia["direction"]
+
+        # ── Row 1: Direction call + reason ────────────────────────────────────
+        st.markdown(
+            f"**{dir_icon.get(d,'➡️')} OI Signal: "
+            f"{'🟢' if d=='bullish' else '🔴' if d=='bearish' else '🟡'} "
+            f"{d.upper()}** — {_oia['reason']}"
+        )
+
+        # ── Row 2: Key metrics ─────────────────────────────────────────────────
+        o1, o2, o3, o4, o5, o6 = st.columns(6)
+        o1.metric("Spot",       f"₹{_oia['spot']:,.0f}")
+        o2.metric("Max Pain",   f"₹{_oia['max_pain']:,.0f}",
+                  delta=f"{_oia['pain_move']:+.0f} pts",
+                  help="Strike where option writers profit most — spot tends to drift here by expiry")
+        o3.metric("ATM PCR",    f"{_oia['atm_pcr']:.2f}",
+                  delta="Bullish" if _oia['atm_pcr'] > 1.1 else ("Bearish" if _oia['atm_pcr'] < 0.9 else "Neutral"))
+        o4.metric("CE Wall 🔴", f"₹{_oia['ce_wall']:,.0f}",
+                  delta=f"+{_oia['points_to_ce']:.0f} pts",
+                  help=f"Resistance — {_oia['ce_wall_oi']/1e5:.1f}L CE OI")
+        o5.metric("PE Wall 🟢", f"₹{_oia['pe_wall']:,.0f}",
+                  delta=f"-{_oia['points_to_pe']:.0f} pts",
+                  help=f"Support — {_oia['pe_wall_oi']/1e5:.1f}L PE OI")
+        o6.metric("Strikes",    _oia['total_strikes'])
+
+        # ── Row 3: Price targets ───────────────────────────────────────────────
+        t1, t2, t3 = st.columns(3)
+
+        with t1:
+            st.markdown("**📈 If Bullish**")
+            st.caption(f"Target: **₹{_oia['ce_target']:,.0f}** ({'+' if _oia['points_to_ce']*0.6 > 0 else ''}{_oia['points_to_ce']*0.6:.0f} pts)")
+            st.caption(f"Resistance wall at **₹{_oia['ce_wall']:,.0f}** ({_oia['ce_wall_oi']/1e5:.1f}L CE OI)")
+            st.caption(f"CE OI change today: **{_oia['ce_chg_above']:+.1f}L** above spot")
+
+        with t2:
+            st.markdown("**📉 If Bearish**")
+            st.caption(f"Target: **₹{_oia['pe_target']:,.0f}** ({'-'}{abs(_oia['points_to_pe']*0.6):.0f} pts)")
+            st.caption(f"Support wall at **₹{_oia['pe_wall']:,.0f}** ({_oia['pe_wall_oi']/1e5:.1f}L PE OI)")
+            st.caption(f"PE OI change today: **{_oia['pe_chg_below']:+.1f}L** below spot")
+
+        with t3:
+            st.markdown("**⚡ Max Pain Pull**")
+            pain_dir = "📈 upward" if _oia['pain_move'] > 0 else "📉 downward"
+            st.caption(f"Max pain at **₹{_oia['max_pain']:,.0f}**")
+            st.caption(f"Spot needs to move **{abs(_oia['pain_move']):.0f} pts {pain_dir}**")
+            st.caption("Spot drifts toward max pain as expiry approaches")
+
+        # ── OI Change bar chart ────────────────────────────────────────────────
+        if _chain and len(_chain) > 3:
+            with st.expander("📊 Strike-wise OI Map", expanded=False):
+                # Build a simple dataframe of top 10 strikes around ATM
+                atm  = _oia["atm"]
+                rows = []
+                for row in sorted(_chain, key=lambda r: abs(float(r.get("strike_price",0)) - atm)):
+                    try:
+                        s    = float(row["strike_price"])
+                        ce_o = float(row.get("call_options",{}).get("market_data",{}).get("oi",0))
+                        pe_o = float(row.get("put_options", {}).get("market_data",{}).get("oi",0))
+                        ce_c = float(row.get("call_options",{}).get("market_data",{}).get("oi_day_change",0))
+                        pe_c = float(row.get("put_options", {}).get("market_data",{}).get("oi_day_change",0))
+                        rows.append({
+                            "Strike": int(s),
+                            "CE OI (L)":     round(ce_o/1e5, 2),
+                            "PE OI (L)":     round(pe_o/1e5, 2),
+                            "CE Chg (L)":    round(ce_c/1e5, 2),
+                            "PE Chg (L)":    round(pe_c/1e5, 2),
+                            "PCR":           round(pe_o/ce_o, 2) if ce_o > 0 else 0,
+                        })
+                        if len(rows) >= 14:   # 7 strikes each side of ATM
+                            break
+                    except (TypeError, ValueError):
+                        continue
+
+                if rows:
+                    _df_oi = pd.DataFrame(rows).set_index("Strike")
+                    st.dataframe(_df_oi, width="stretch")
+                    st.caption(f"🔴 CE wall: ₹{_oia['ce_wall']:,.0f} | 🟢 PE wall: ₹{_oia['pe_wall']:,.0f} | ⚡ Max Pain: ₹{_oia['max_pain']:,.0f}")
+    else:
+        st.info("OI data unavailable — chain not loaded yet. Check the OI Diagnostic above.")
+
 # MTF FILTER STATUS PANEL — always visible when token is present
 # ==============================================================================
 if ACCESS_TOKEN:
