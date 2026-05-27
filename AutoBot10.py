@@ -322,8 +322,23 @@ def resolve_atm_option_key(token: str, spot: float, option_type: str,
     # Formula fallback
     expiry_str = get_active_expiry_str()
     expiry     = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-    symbol     = f"NIFTY{expiry.strftime('%y%b%d').upper()}{atm_strike}{ot}"
-    return f"NSE_FO|{symbol}", symbol
+    yy     = expiry.strftime('%y')
+    dd     = f"{expiry.day:02d}"
+    mon    = expiry.strftime('%b').upper()
+    symbol = f"NIFTY{yy}{dd}{mon}{atm_strike}{ot}"
+    ikey   = f"NSE_FO|{symbol}"
+    ltp    = fetch_ltp(token, ikey)
+    if ltp is not None and ltp > 0:
+        return ikey, symbol
+    for delta in [50, -50, 100, -100]:
+        alt_strike = atm_strike + delta
+        alt_sym    = f"NIFTY{yy}{dd}{mon}{alt_strike}{ot}"
+        alt_key    = f"NSE_FO|{alt_sym}"
+        alt_ltp    = fetch_ltp(token, alt_key)
+        if alt_ltp is not None and alt_ltp > 0:
+            st.info(f"ATM {atm_strike} illiquid — using {alt_strike}")
+            return alt_key, alt_sym
+    return ikey, symbol
 
 
 # ==============================================================================
